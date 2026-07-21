@@ -50,24 +50,29 @@ class WatchlistTable(DataTable):
         self.add_column("갱신시각", key=COL_UPDATED, width=10)
 
     def sync_rows(self, watchlist: Watchlist) -> None:
-        """Add/remove rows so the table matches the current watchlist."""
+        """Add/remove rows so the table matches the current watchlist.
+
+        New rows are added in watchlist order (i.e. the order symbols were
+        added), not set-iteration order, so the table stays stable across runs.
+        """
         existing = set(self.rows.keys())
         wanted = set(watchlist.symbols)
 
         for symbol in existing - wanted:
             self.remove_row(symbol)
 
-        for symbol in wanted - existing:
-            item = watchlist.items[symbol]
-            self.add_row(
-                item.symbol,
-                item.name or item.symbol,
-                "-",
-                "-",
-                "-",
-                "-",
-                key=symbol,
-            )
+        for symbol in watchlist.symbols:
+            if symbol not in existing:
+                item = watchlist.items[symbol]
+                self.add_row(
+                    item.symbol,
+                    item.name or item.symbol,
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    key=symbol,
+                )
 
     @property
     def selected_symbol(self) -> str | None:
