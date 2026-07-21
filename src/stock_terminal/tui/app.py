@@ -30,8 +30,16 @@ class StockTerminalApp(App):
         ("t", "set_alert", "알림설정"),
         ("m", "toggle_chart_mode", "차트모드"),
         ("i", "toggle_interval", "봉주기"),
+        ("v", "cycle_view", "화면전환"),
         ("q", "quit", "종료"),
     ]
+
+    _VIEW_MODES = ["both", "chart", "list"]
+    _VIEW_MODE_LABELS = {
+        "both": "전체 보기",
+        "chart": "차트만 보기",
+        "list": "목록만 보기",
+    }
 
     def __init__(self, settings: Settings) -> None:
         super().__init__()
@@ -41,6 +49,7 @@ class StockTerminalApp(App):
         )
         ensure_data_dir()
         self.watchlist = Watchlist.load(WATCHLIST_PATH)
+        self._view_mode = "both"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -157,6 +166,17 @@ class StockTerminalApp(App):
         if result is None:
             return
         self.watchlist.set_alerts(symbol, result.upper, result.lower)
+
+    def action_cycle_view(self) -> None:
+        idx = self._VIEW_MODES.index(self._view_mode)
+        self._view_mode = self._VIEW_MODES[(idx + 1) % len(self._VIEW_MODES)]
+
+        table = self.query_one(WatchlistTable)
+        chart = self.query_one(ChartPanel)
+        table.display = self._view_mode in ("both", "list")
+        chart.display = self._view_mode in ("both", "chart")
+
+        self.notify(self._VIEW_MODE_LABELS[self._view_mode], timeout=1.5)
 
     def action_toggle_chart_mode(self) -> None:
         self.query_one(ChartPanel).toggle_mode()
