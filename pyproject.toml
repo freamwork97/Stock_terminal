@@ -1,0 +1,33 @@
+[project]
+name = "stock-terminal"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "freamwork97", email = "jsy11123@naver.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.2",
+    "textual>=8.2.8",
+    "textual-plotext>=1.0.1",
+]
+
+[project.scripts]
+stock-terminal = "stock_terminal:main"
+
+[build-system]
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

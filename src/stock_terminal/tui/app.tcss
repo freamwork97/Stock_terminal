@@ -1,0 +1,18 @@
+Screen {
+    layout: vertical;
+}
+
+Horizontal {
+    height: 1fr;
+}
+
+WatchlistTable {
+    width: 1fr;
+    height: 1fr;
+}
+
+ChartPanel {
+    width: 1fr;
+    height: 1fr;
+    border-left: solid $accent;
+}
