@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "textual>=8.2.8",
     "textual-plotext>=1.0.1",
+    "tzdata>=2025.2; platform_system == 'Windows'",
 ]
 
 [project.scripts]

@@ -18,6 +18,7 @@ class AddSymbolResult:
     symbol: str
     name: str
     prev_close: object  # Decimal | None, kept loosely typed to avoid import cycle
+    currency: str
 
 
 class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
@@ -93,7 +94,10 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
             info = stocks[0]
             prev_close = await self._client.get_previous_close(symbol)
             self._verified = AddSymbolResult(
-                symbol=info.symbol, name=info.name, prev_close=prev_close
+                symbol=info.symbol,
+                name=info.name,
+                prev_close=prev_close,
+                currency=info.currency,
             )
             status.update(f"확인됨: {info.name} ({info.market})")
             confirm_button.disabled = False

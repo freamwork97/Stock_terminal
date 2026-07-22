@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -17,6 +19,22 @@ from stock_terminal.tui.screens.add_symbol import AddSymbolResult, AddSymbolScre
 from stock_terminal.tui.screens.set_alert import AlertResult, SetAlertScreen
 from stock_terminal.tui.widgets.chart_panel import ChartPanel
 from stock_terminal.tui.widgets.watchlist_table import WatchlistTable
+
+_US_EASTERN = ZoneInfo("America/New_York")
+
+
+def _trading_day_key(currency: str) -> str:
+    """Calendar date the market's *current* session belongs to.
+
+    KRX trades within a single KST day, so the local KST date is a fine
+    proxy for "has the trading day rolled over". US markets run from
+    22:30/23:30 KST through 05:00/06:00 KST the next day, so using the KST
+    date would flag an in-progress US session as stale at KST midnight and
+    refetch prev_close mid-session. Anchor USD symbols to US/Eastern instead.
+    """
+    if currency == "USD":
+        return datetime.now(_US_EASTERN).date().isoformat()
+    return date.today().isoformat()
 
 
 class StockTerminalApp(App):
@@ -80,6 +98,7 @@ class StockTerminalApp(App):
         symbols = self.watchlist.symbols
         if not symbols:
             return
+        await self._refresh_stale_prev_closes(symbols)
         try:
             prices = await self.client.get_prices(symbols)
             price_map = {p.symbol: p for p in prices}
@@ -91,6 +110,37 @@ class StockTerminalApp(App):
             self.sub_title = ""
         except TossAPIError as exc:
             self.sub_title = f"시세 오류: {exc}"
+
+    async def _refresh_stale_prev_closes(self, symbols: list[str]) -> None:
+        """Re-fetch prev_close for items whose baseline predates today.
+
+        prev_close is a snapshot taken when a symbol was added (or last
+        refreshed); without this, change %/amount would keep comparing the
+        live price against a stale, ever-older baseline instead of resetting
+        to yesterday's close each trading day. Staleness is judged per-market
+        (see _trading_day_key) since KRW and USD symbols roll over at
+        different wall-clock moments.
+        """
+        for symbol in symbols:
+            item = self.watchlist.items[symbol]
+            if not item.currency:
+                # Legacy items saved before currency was tracked.
+                try:
+                    stocks = await self.client.get_stocks([symbol])
+                except TossAPIError:
+                    stocks = []
+                if stocks:
+                    item.currency = stocks[0].currency
+                    self.watchlist.set_currency(symbol, item.currency)
+
+            today = _trading_day_key(item.currency)
+            if item.prev_close_date == today:
+                continue
+            try:
+                prev_close = await self.client.get_previous_close(symbol)
+            except TossAPIError:
+                continue
+            self.watchlist.set_prev_close(symbol, prev_close, today)
 
     @work(exclusive=True, group="chart-poll")
     async def poll_chart(self) -> None:
@@ -125,7 +175,11 @@ class StockTerminalApp(App):
         if result is None:
             return
         item = WatchlistItem(
-            symbol=result.symbol, name=result.name, prev_close=result.prev_close
+            symbol=result.symbol,
+            name=result.name,
+            prev_close=result.prev_close,
+            prev_close_date=_trading_day_key(result.currency),
+            currency=result.currency,
         )
         self.watchlist.add(item)
         self.query_one(WatchlistTable).sync_rows(self.watchlist)

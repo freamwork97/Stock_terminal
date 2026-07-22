@@ -15,6 +15,8 @@ class WatchlistItem:
     alert_upper: Decimal | None = None
     alert_lower: Decimal | None = None
     prev_close: Decimal | None = None
+    prev_close_date: str | None = None  # ISO date the prev_close was fetched for
+    currency: str = ""  # market's trading-day calendar depends on this
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -35,6 +37,8 @@ class WatchlistItem:
             alert_upper=dec("alert_upper"),
             alert_lower=dec("alert_lower"),
             prev_close=dec("prev_close"),
+            prev_close_date=data.get("prev_close_date"),
+            currency=data.get("currency", ""),
         )
 
 
@@ -82,9 +86,19 @@ class Watchlist:
         item.alert_lower = lower
         self.save()
 
-    def set_prev_close(self, symbol: str, prev_close: Decimal | None) -> None:
+    def set_currency(self, symbol: str, currency: str) -> None:
+        item = self.items.get(symbol)
+        if item is None:
+            return
+        item.currency = currency
+        self.save()
+
+    def set_prev_close(
+        self, symbol: str, prev_close: Decimal | None, prev_close_date: str | None
+    ) -> None:
         item = self.items.get(symbol)
         if item is None:
             return
         item.prev_close = prev_close
+        item.prev_close_date = prev_close_date
         self.save()
