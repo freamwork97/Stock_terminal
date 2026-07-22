@@ -62,6 +62,31 @@ async def test_get_prices_caches_token_across_calls(client: TossInvestClient) ->
 
 
 @respx.mock
+async def test_get_prices_handles_null_timestamp(client: TossInvestClient) -> None:
+    _token_route()
+    respx.get(f"{BASE_URL}/api/v1/prices").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": [
+                    {
+                        "symbol": "114800",
+                        "timestamp": None,
+                        "lastPrice": "1111",
+                        "currency": "KRW",
+                    }
+                ]
+            },
+        )
+    )
+
+    prices = await client.get_prices(["114800"])
+
+    assert prices[0].timestamp is None
+    assert str(prices[0].last_price) == "1111"
+
+
+@respx.mock
 async def test_auth_failure_raises_toss_auth_error(client: TossInvestClient) -> None:
     respx.post(f"{BASE_URL}/oauth2/token").mock(
         return_value=httpx.Response(401, json={"error": "invalid_client"})

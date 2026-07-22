@@ -117,9 +117,10 @@ class WatchlistTable(DataTable):
             self.update_cell(
                 symbol, COL_CHANGE_PCT, Text(change_pct_text, style=style)
             )
-            self.update_cell(
-                symbol, COL_UPDATED, price.timestamp.strftime("%H:%M:%S")
+            updated_text = (
+                price.timestamp.strftime("%H:%M:%S") if price.timestamp else "-"
             )
+            self.update_cell(symbol, COL_UPDATED, updated_text)
 
             if item.alert_upper is not None and price.last_price >= item.alert_upper:
                 triggered.append(symbol)

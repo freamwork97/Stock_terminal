@@ -17,15 +17,18 @@ class Price:
     symbol: str
     last_price: Decimal
     currency: str
-    timestamp: datetime
+    timestamp: datetime | None
 
     @classmethod
     def from_json(cls, data: dict) -> Price:
+        # The API sends timestamp: null for symbols with no trade yet today
+        # (e.g. an ETF that hasn't opened) even though lastPrice is present.
+        raw_timestamp = data["timestamp"]
         return cls(
             symbol=data["symbol"],
             last_price=Decimal(str(data["lastPrice"])),
             currency=data["currency"],
-            timestamp=datetime.fromisoformat(data["timestamp"]),
+            timestamp=datetime.fromisoformat(raw_timestamp) if raw_timestamp else None,
         )
 
 
