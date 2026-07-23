@@ -92,7 +92,7 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
                 status.update(f"'{symbol}' 종목을 찾을 수 없습니다.")
                 return
             info = stocks[0]
-            prev_close = await self._client.get_previous_close(symbol)
+            prev_close = await self._client.get_previous_close(symbol, info.currency)
             self._verified = AddSymbolResult(
                 symbol=info.symbol,
                 name=info.name,

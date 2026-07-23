@@ -137,7 +137,9 @@ class StockTerminalApp(App):
             if item.prev_close_date == today:
                 continue
             try:
-                prev_close = await self.client.get_previous_close(symbol)
+                prev_close = await self.client.get_previous_close(
+                    symbol, item.currency
+                )
             except TossAPIError:
                 continue
             self.watchlist.set_prev_close(symbol, prev_close, today)

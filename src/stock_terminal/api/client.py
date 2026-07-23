@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -24,6 +25,10 @@ from stock_terminal.api.models import Candle, Price, StockInfo
 
 TOKEN_REFRESH_MARGIN_SECONDS = 60
 MAX_SYMBOLS_PER_CALL = 200
+
+_KST = ZoneInfo("Asia/Seoul")
+_KRX_CLOSE_AUCTION_START = dt_time(15, 20)
+_KRX_CLOSE_AUCTION_END = dt_time(15, 35)
 
 
 class TossInvestClient:
@@ -136,17 +141,22 @@ class TossInvestClient:
         return results
 
     async def get_candles(
-        self, symbol: str, interval: str = "1d", count: int = 100
+        self,
+        symbol: str,
+        interval: str = "1d",
+        count: int = 100,
+        before: str | None = None,
     ) -> list[Candle]:
-        response = await self._request(
-            "GET",
-            "/api/v1/candles",
-            params={"symbol": symbol, "interval": interval, "count": count},
-        )
+        params = {"symbol": symbol, "interval": interval, "count": count}
+        if before is not None:
+            params["before"] = before
+        response = await self._request("GET", "/api/v1/candles", params=params)
         data = response.json()["result"]
         return [Candle.from_json(item) for item in data["candles"]]
 
-    async def get_previous_close(self, symbol: str) -> Decimal | None:
+    async def get_previous_close(
+        self, symbol: str, currency: str | None = None
+    ) -> Decimal | None:
         """Best-effort previous close, used as the baseline for change %.
 
         /api/v1/prices has no previousClose field, so we derive it from the
@@ -156,10 +166,51 @@ class TossInvestClient:
         if not candles:
             return None
         today = datetime.now(timezone.utc).astimezone().date()
+        prev_candle = None
         for candle in sorted(candles, key=lambda c: c.timestamp, reverse=True):
             if candle.timestamp.date() != today:
-                return candle.close
-        return candles[0].close
+                prev_candle = candle
+                break
+        prev_candle = prev_candle or candles[0]
+
+        if currency == "KRW":
+            official_close = await self._krx_official_close(
+                symbol, prev_candle.timestamp.astimezone(_KST).date()
+            )
+            if official_close is not None:
+                return official_close
+        return prev_candle.close
+
+    async def _krx_official_close(
+        self, symbol: str, trading_day: date
+    ) -> Decimal | None:
+        """The KRX regular-session closing-auction price for `trading_day`.
+
+        KRX's 1d candle close (as served by /api/v1/candles) keeps updating
+        through NXT's after-hours session (until ~20:00 KST), so it drifts
+        away from the official 15:30 KST closing-auction price - sometimes
+        by more than 1%. The closing auction always prints as a distinct
+        volume spike in the surrounding 1m candles, so we pick that instead.
+        """
+        window_end = datetime.combine(
+            trading_day, _KRX_CLOSE_AUCTION_END, tzinfo=_KST
+        ) + timedelta(minutes=1)
+        try:
+            candles = await self.get_candles(
+                symbol, interval="1m", count=20, before=window_end.isoformat()
+            )
+        except TossAPIError:
+            return None
+        window = [
+            c
+            for c in candles
+            if _KRX_CLOSE_AUCTION_START
+            <= c.timestamp.astimezone(_KST).time()
+            <= _KRX_CLOSE_AUCTION_END
+        ]
+        if not window:
+            return None
+        return max(window, key=lambda c: c.volume).close
 
 
 def _chunk(items: list[str], size: int):

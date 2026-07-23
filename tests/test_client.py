@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -215,3 +216,83 @@ async def test_get_previous_close_skips_todays_candle(client: TossInvestClient) 
     prev_close = await client.get_previous_close("005930")
 
     assert str(prev_close) == "105"
+
+
+@respx.mock
+async def test_get_previous_close_krw_uses_krx_closing_auction_not_nxt_afterhours(
+    client: TossInvestClient,
+) -> None:
+    """KRW previous close must use the 15:30 KST KRX auction print, not the
+    1d candle's close - which keeps drifting through NXT after-hours trading
+    (until ~20:00 KST) and can end up 1%+ away from the official close."""
+    _token_route()
+    kst = ZoneInfo("Asia/Seoul")
+    today = datetime.now(kst).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(days=1)
+
+    def candles_side_effect(request: httpx.Request) -> httpx.Response:
+        interval = request.url.params.get("interval")
+        if interval == "1d":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "candles": [
+                            {
+                                "timestamp": today.isoformat(),
+                                "openPrice": "268000",
+                                "highPrice": "269500",
+                                "lowPrice": "265000",
+                                "closePrice": "267500",
+                                "volume": "1513909",
+                            },
+                            {
+                                "timestamp": yesterday.isoformat(),
+                                "openPrice": "265000",
+                                "highPrice": "273000",
+                                "lowPrice": "257000",
+                                # Contaminated by NXT after-hours trading.
+                                "closePrice": "273000",
+                                "volume": "29117852",
+                            },
+                        ],
+                        "nextBefore": None,
+                    }
+                },
+            )
+
+        base = yesterday.replace(hour=15, minute=20)
+        minute_candles = []
+        for i in range(16):
+            ts = base + timedelta(minutes=i)
+            if i == 11:  # 15:31 KST: the closing single-price auction print.
+                minute_candles.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "openPrice": "269750",
+                        "highPrice": "270000",
+                        "lowPrice": "269750",
+                        "closePrice": "270000",
+                        "volume": "1752210",
+                    }
+                )
+            else:
+                minute_candles.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "openPrice": "269750",
+                        "highPrice": "269750",
+                        "lowPrice": "269750",
+                        "closePrice": "269750",
+                        "volume": "0",
+                    }
+                )
+        return httpx.Response(
+            200, json={"result": {"candles": minute_candles, "nextBefore": None}}
+        )
+
+    respx.get(f"{BASE_URL}/api/v1/candles").mock(side_effect=candles_side_effect)
+
+    prev_close = await client.get_previous_close("005930", "KRW")
+
+    assert str(prev_close) == "270000"
