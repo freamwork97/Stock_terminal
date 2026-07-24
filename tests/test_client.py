@@ -296,3 +296,77 @@ async def test_get_previous_close_krw_uses_krx_closing_auction_not_nxt_afterhour
     prev_close = await client.get_previous_close("005930", "KRW")
 
     assert str(prev_close) == "270000"
+
+
+@respx.mock
+async def test_get_previous_close_usd_uses_us_eastern_trading_day(
+    client: TossInvestClient,
+) -> None:
+    """USD previous close must reset on the US/Eastern calendar day, not KST
+    or system-local time. US regular hours run 22:30/23:30-05:00/06:00 KST,
+    so for most of the Korean day the "current" US/Eastern trading day is
+    still in progress (or its regular session already closed but its own
+    day hasn't rolled over) - using anything but US/Eastern to judge which
+    candle is "today's" makes the lookup pick that day's own close instead
+    of the real previous day's, one day too recent. It must also ignore a
+    stray candle dated *after* today (e.g. a not-yet-started next session
+    placeholder the feed may emit early), not just skip candles dated today.
+    """
+    _token_route()
+    et = ZoneInfo("America/New_York")
+    et_today = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
+    et_yesterday = et_today - timedelta(days=1)
+    et_before_that = et_today - timedelta(days=2)
+
+    respx.get(f"{BASE_URL}/api/v1/candles").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": {
+                    "candles": [
+                        {
+                            # Stray placeholder for a session that hasn't
+                            # started yet.
+                            "timestamp": (et_today + timedelta(days=1)).isoformat(),
+                            "openPrice": "545",
+                            "highPrice": "546",
+                            "lowPrice": "544",
+                            "closePrice": "545",
+                            "volume": "10",
+                        },
+                        {
+                            # Today's (ET) own completed regular session.
+                            "timestamp": et_today.isoformat(),
+                            "openPrice": "530",
+                            "highPrice": "541",
+                            "lowPrice": "529",
+                            "closePrice": "539.69",
+                            "volume": "27000000",
+                        },
+                        {
+                            # The real previous close.
+                            "timestamp": et_yesterday.isoformat(),
+                            "openPrice": "550",
+                            "highPrice": "555",
+                            "lowPrice": "548",
+                            "closePrice": "552.33",
+                            "volume": "24000000",
+                        },
+                        {
+                            "timestamp": et_before_that.isoformat(),
+                            "openPrice": "500",
+                            "highPrice": "510",
+                            "lowPrice": "495",
+                            "closePrice": "503.57",
+                            "volume": "23000000",
+                        },
+                    ],
+                    "nextBefore": None,
+                }
+            },
+        )
+    )
+
+    prev_close = await client.get_previous_close("AMD", "USD")
+
+    assert str(prev_close) == "552.33"

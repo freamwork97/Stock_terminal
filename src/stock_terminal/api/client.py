@@ -27,8 +27,31 @@ TOKEN_REFRESH_MARGIN_SECONDS = 60
 MAX_SYMBOLS_PER_CALL = 200
 
 _KST = ZoneInfo("Asia/Seoul")
+_US_EASTERN = ZoneInfo("America/New_York")
 _KRX_CLOSE_AUCTION_START = dt_time(15, 20)
 _KRX_CLOSE_AUCTION_END = dt_time(15, 35)
+
+
+def _market_zone(currency: str | None) -> ZoneInfo | None:
+    """Timezone whose calendar date defines "today" for `currency`'s market.
+
+    KRX and NXT both run within a single KST calendar day. US markets
+    (pre-market through after-hours) run on the US/Eastern calendar day.
+    Falling back to system-local time here would misjudge which candle is
+    "today's still-forming one" - and therefore should be excluded from the
+    previous-close lookup - whenever the host machine's timezone isn't KST.
+    """
+    if currency == "KRW":
+        return _KST
+    if currency == "USD":
+        return _US_EASTERN
+    return None
+
+
+def _trading_day(instant: datetime, zone: ZoneInfo | None) -> date:
+    if zone is None:
+        return instant.astimezone().date()
+    return instant.astimezone(zone).date()
 
 
 class TossInvestClient:
@@ -161,14 +184,25 @@ class TossInvestClient:
 
         /api/v1/prices has no previousClose field, so we derive it from the
         daily candle series: the most recent candle whose date isn't today.
+
+        count=5 (not 2): the feed can carry a stray same-instant/placeholder
+        candle for the not-yet-started next session (seen for USD symbols,
+        where "today" briefly holds an early, low-volume entry before the
+        US/Eastern calendar day has actually begun) - with count=2 that alone
+        could crowd out the real previous session, so we look back further.
         """
-        candles = await self.get_candles(symbol, interval="1d", count=2)
+        candles = await self.get_candles(symbol, interval="1d", count=5)
         if not candles:
             return None
-        today = datetime.now(timezone.utc).astimezone().date()
+        zone = _market_zone(currency)
+        today = _trading_day(datetime.now(timezone.utc), zone)
         prev_candle = None
         for candle in sorted(candles, key=lambda c: c.timestamp, reverse=True):
-            if candle.timestamp.date() != today:
+            # Strictly earlier than today, not just "!= today": a candle
+            # dated *after* today shouldn't happen, but if the upstream feed
+            # ever emits one (clock skew, a stray placeholder bucket), it
+            # must never be mistaken for a completed prior session.
+            if _trading_day(candle.timestamp, zone) < today:
                 prev_candle = candle
                 break
         prev_candle = prev_candle or candles[0]
