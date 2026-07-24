@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -299,74 +299,108 @@ async def test_get_previous_close_krw_uses_krx_closing_auction_not_nxt_afterhour
 
 
 @respx.mock
-async def test_get_previous_close_usd_uses_us_eastern_trading_day(
+async def test_get_previous_close_usd_uses_16_00_et_closing_auction(
     client: TossInvestClient,
 ) -> None:
-    """USD previous close must reset on the US/Eastern calendar day, not KST
-    or system-local time. US regular hours run 22:30/23:30-05:00/06:00 KST,
-    so for most of the Korean day the "current" US/Eastern trading day is
-    still in progress (or its regular session already closed but its own
-    day hasn't rolled over) - using anything but US/Eastern to judge which
-    candle is "today's" makes the lookup pick that day's own close instead
-    of the real previous day's, one day too recent. It must also ignore a
-    stray candle dated *after* today (e.g. a not-yet-started next session
-    placeholder the feed may emit early), not just skip candles dated today.
+    """USD previous close must be the 16:00 ET closing-auction print, not
+    the 1d candle's close.
+
+    After-hours trades (16:00-20:00 ET) get bucketed by this feed under the
+    *next* calendar day instead of staying in the session's own day, so
+    during after-hours the most recently *completed* regular session is
+    "today" (ET), not yesterday - the reference must not be pushed back an
+    extra day just because a stray "tomorrow"-dated placeholder exists.
+    Separately, the 1d candle's own close field can drift from the true
+    16:00 print, so the 1-minute auction-window volume spike must win.
     """
     _token_route()
     et = ZoneInfo("America/New_York")
-    et_today = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
-    et_yesterday = et_today - timedelta(days=1)
-    et_before_that = et_today - timedelta(days=2)
-
-    respx.get(f"{BASE_URL}/api/v1/candles").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "result": {
-                    "candles": [
-                        {
-                            # Stray placeholder for a session that hasn't
-                            # started yet.
-                            "timestamp": (et_today + timedelta(days=1)).isoformat(),
-                            "openPrice": "545",
-                            "highPrice": "546",
-                            "lowPrice": "544",
-                            "closePrice": "545",
-                            "volume": "10",
-                        },
-                        {
-                            # Today's (ET) own completed regular session.
-                            "timestamp": et_today.isoformat(),
-                            "openPrice": "530",
-                            "highPrice": "541",
-                            "lowPrice": "529",
-                            "closePrice": "539.69",
-                            "volume": "27000000",
-                        },
-                        {
-                            # The real previous close.
-                            "timestamp": et_yesterday.isoformat(),
-                            "openPrice": "550",
-                            "highPrice": "555",
-                            "lowPrice": "548",
-                            "closePrice": "552.33",
-                            "volume": "24000000",
-                        },
-                        {
-                            "timestamp": et_before_that.isoformat(),
-                            "openPrice": "500",
-                            "highPrice": "510",
-                            "lowPrice": "495",
-                            "closePrice": "503.57",
-                            "volume": "23000000",
-                        },
-                    ],
-                    "nextBefore": None,
-                }
-            },
-        )
+    now_et = datetime.now(et)
+    reference_date = (
+        now_et.date()
+        if now_et.time() >= dt_time(16, 0)
+        else now_et.date() - timedelta(days=1)
     )
+    day_before = reference_date - timedelta(days=1)
+    tomorrow_stub = datetime.combine(
+        reference_date + timedelta(days=1), dt_time(0, 0), tzinfo=et
+    )
+    reference_open = datetime.combine(reference_date, dt_time(0, 0), tzinfo=et)
+    day_before_open = datetime.combine(day_before, dt_time(0, 0), tzinfo=et)
+
+    def candles_side_effect(request: httpx.Request) -> httpx.Response:
+        interval = request.url.params.get("interval")
+        if interval == "1d":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "candles": [
+                            {
+                                # Stray placeholder for tomorrow's session.
+                                "timestamp": tomorrow_stub.isoformat(),
+                                "openPrice": "545",
+                                "highPrice": "546",
+                                "lowPrice": "544",
+                                "closePrice": "545",
+                                "volume": "10",
+                            },
+                            {
+                                # Drifted from the true 16:00 print (541.20
+                                # instead of 539.69) - must be overridden.
+                                "timestamp": reference_open.isoformat(),
+                                "openPrice": "530",
+                                "highPrice": "546",
+                                "lowPrice": "529",
+                                "closePrice": "541.20",
+                                "volume": "27000000",
+                            },
+                            {
+                                "timestamp": day_before_open.isoformat(),
+                                "openPrice": "550",
+                                "highPrice": "555",
+                                "lowPrice": "548",
+                                "closePrice": "552.33",
+                                "volume": "24000000",
+                            },
+                        ],
+                        "nextBefore": None,
+                    }
+                },
+            )
+
+        base = datetime.combine(reference_date, dt_time(15, 55), tzinfo=et)
+        minute_candles = []
+        for i in range(11):
+            ts = base + timedelta(minutes=i)
+            if i == 5:  # 16:00 ET: the closing-auction print.
+                minute_candles.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "openPrice": "538",
+                        "highPrice": "540",
+                        "lowPrice": "538",
+                        "closePrice": "539.69",
+                        "volume": "1879184",
+                    }
+                )
+            else:
+                minute_candles.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "openPrice": "541",
+                        "highPrice": "541",
+                        "lowPrice": "541",
+                        "closePrice": "541",
+                        "volume": "0",
+                    }
+                )
+        return httpx.Response(
+            200, json={"result": {"candles": minute_candles, "nextBefore": None}}
+        )
+
+    respx.get(f"{BASE_URL}/api/v1/candles").mock(side_effect=candles_side_effect)
 
     prev_close = await client.get_previous_close("AMD", "USD")
 
-    assert str(prev_close) == "552.33"
+    assert str(prev_close) == "539.69"

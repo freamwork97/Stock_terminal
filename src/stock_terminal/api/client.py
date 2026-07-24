@@ -28,30 +28,41 @@ MAX_SYMBOLS_PER_CALL = 200
 
 _KST = ZoneInfo("Asia/Seoul")
 _US_EASTERN = ZoneInfo("America/New_York")
-_KRX_CLOSE_AUCTION_START = dt_time(15, 20)
-_KRX_CLOSE_AUCTION_END = dt_time(15, 35)
 
 
-def _market_zone(currency: str | None) -> ZoneInfo | None:
-    """Timezone whose calendar date defines "today" for `currency`'s market.
+class _MarketSession:
+    """Regular-session close time + closing-auction window, in the market's
+    own timezone. Used to pin down the exact previous-close baseline instead
+    of trusting the /api/v1/candles 1d aggregate, whose day-bucketing turns
+    out to be unreliable for this in different ways per market:
 
-    KRX and NXT both run within a single KST calendar day. US markets
-    (pre-market through after-hours) run on the US/Eastern calendar day.
-    Falling back to system-local time here would misjudge which candle is
-    "today's still-forming one" - and therefore should be excluded from the
-    previous-close lookup - whenever the host machine's timezone isn't KST.
+    - KRW: a day's 1d candle keeps absorbing NXT after-hours trades (until
+      ~20:00 KST), so its "close" drifts away from the 15:30 KRX auction
+      price - sometimes by more than 1%.
+    - USD: after-hours trades (16:00-20:00 ET) get bucketed under the
+      *next* calendar day instead of staying in today's, so a naive
+      "skip the candle dated today" check ends up skipping the correct,
+      already-final regular-session close and falling back to the day
+      before that.
+
+    Both are avoided by finding the real trading day ourselves (via the
+    close-time cutoff) and reading the closing-auction print directly out
+    of 1-minute candles, which is a distinct volume spike in both markets.
     """
-    if currency == "KRW":
-        return _KST
-    if currency == "USD":
-        return _US_EASTERN
-    return None
+
+    def __init__(
+        self, zone: ZoneInfo, close: dt_time, auction_start: dt_time, auction_end: dt_time
+    ) -> None:
+        self.zone = zone
+        self.close = close
+        self.auction_start = auction_start
+        self.auction_end = auction_end
 
 
-def _trading_day(instant: datetime, zone: ZoneInfo | None) -> date:
-    if zone is None:
-        return instant.astimezone().date()
-    return instant.astimezone(zone).date()
+_KRX_SESSION = _MarketSession(_KST, dt_time(15, 30), dt_time(15, 20), dt_time(15, 35))
+_US_SESSION = _MarketSession(_US_EASTERN, dt_time(16, 0), dt_time(15, 55), dt_time(16, 5))
+
+_SESSIONS = {"KRW": _KRX_SESSION, "USD": _US_SESSION}
 
 
 class TossInvestClient:
@@ -182,69 +193,71 @@ class TossInvestClient:
     ) -> Decimal | None:
         """Best-effort previous close, used as the baseline for change %.
 
-        /api/v1/prices has no previousClose field, so we derive it from the
-        daily candle series: the most recent candle whose date isn't today.
-
-        count=5 (not 2): the feed can carry a stray same-instant/placeholder
-        candle for the not-yet-started next session (seen for USD symbols,
-        where "today" briefly holds an early, low-volume entry before the
-        US/Eastern calendar day has actually begun) - with count=2 that alone
-        could crowd out the real previous session, so we look back further.
+        For KRW/USD this is "the most recently completed regular session's
+        closing-auction price" (see `_MarketSession`), not the 1d candle's
+        close, since that field is unreliable in different ways per market.
+        For anything else, falls back to the 1d candle series: the most
+        recent candle whose date isn't today.
         """
-        candles = await self.get_candles(symbol, interval="1d", count=5)
+        session = _SESSIONS.get(currency or "")
+        if session is not None:
+            return await self._session_close(symbol, session)
+
+        candles = await self.get_candles(symbol, interval="1d", count=2)
         if not candles:
             return None
-        zone = _market_zone(currency)
-        today = _trading_day(datetime.now(timezone.utc), zone)
-        prev_candle = None
+        today = datetime.now(timezone.utc).astimezone().date()
         for candle in sorted(candles, key=lambda c: c.timestamp, reverse=True):
-            # Strictly earlier than today, not just "!= today": a candle
-            # dated *after* today shouldn't happen, but if the upstream feed
-            # ever emits one (clock skew, a stray placeholder bucket), it
-            # must never be mistaken for a completed prior session.
-            if _trading_day(candle.timestamp, zone) < today:
-                prev_candle = candle
-                break
-        prev_candle = prev_candle or candles[0]
+            if candle.timestamp.date() != today:
+                return candle.close
+        return candles[0].close
 
-        if currency == "KRW":
-            official_close = await self._krx_official_close(
-                symbol, prev_candle.timestamp.astimezone(_KST).date()
-            )
-            if official_close is not None:
-                return official_close
-        return prev_candle.close
-
-    async def _krx_official_close(
-        self, symbol: str, trading_day: date
+    async def _session_close(
+        self, symbol: str, session: _MarketSession
     ) -> Decimal | None:
-        """The KRX regular-session closing-auction price for `trading_day`.
+        now = datetime.now(timezone.utc).astimezone(session.zone)
+        reference_date = (
+            now.date() if now.time() >= session.close else now.date() - timedelta(days=1)
+        )
 
-        KRX's 1d candle close (as served by /api/v1/candles) keeps updating
-        through NXT's after-hours session (until ~20:00 KST), so it drifts
-        away from the official 15:30 KST closing-auction price - sometimes
-        by more than 1%. The closing auction always prints as a distinct
-        volume spike in the surrounding 1m candles, so we pick that instead.
-        """
+        # Walk back to the most recent actual trading day <= reference_date
+        # (skips weekends/holidays, and any stray candle the feed dates
+        # *after* today - e.g. USD after-hours bucketed as tomorrow).
+        candles = await self.get_candles(symbol, interval="1d", count=5)
+        trading_day = None
+        for candle in sorted(candles, key=lambda c: c.timestamp, reverse=True):
+            candle_date = candle.timestamp.astimezone(session.zone).date()
+            if candle_date <= reference_date:
+                trading_day = candle_date
+                break
+        if trading_day is None:
+            return candles[0].close if candles else None
+
         window_end = datetime.combine(
-            trading_day, _KRX_CLOSE_AUCTION_END, tzinfo=_KST
+            trading_day, session.auction_end, tzinfo=session.zone
         ) + timedelta(minutes=1)
         try:
-            candles = await self.get_candles(
+            minute_candles = await self.get_candles(
                 symbol, interval="1m", count=20, before=window_end.isoformat()
             )
         except TossAPIError:
-            return None
+            minute_candles = []
         window = [
             c
-            for c in candles
-            if _KRX_CLOSE_AUCTION_START
-            <= c.timestamp.astimezone(_KST).time()
-            <= _KRX_CLOSE_AUCTION_END
+            for c in minute_candles
+            if session.auction_start
+            <= c.timestamp.astimezone(session.zone).time()
+            <= session.auction_end
         ]
-        if not window:
-            return None
-        return max(window, key=lambda c: c.volume).close
+        if window:
+            return max(window, key=lambda c: c.volume).close
+
+        # No 1m data for the auction window (e.g. a thin symbol) - fall
+        # back to that day's 1d candle close.
+        for candle in candles:
+            if candle.timestamp.astimezone(session.zone).date() == trading_day:
+                return candle.close
+        return None
 
 
 def _chunk(items: list[str], size: int):
