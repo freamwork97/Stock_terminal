@@ -65,6 +65,34 @@ _US_SESSION = _MarketSession(_US_EASTERN, dt_time(16, 0), dt_time(15, 55), dt_ti
 _SESSIONS = {"KRW": _KRX_SESSION, "USD": _US_SESSION}
 
 
+def _reference_session_date(session: _MarketSession) -> date:
+    """Calendar date whose closing print is *right now's* correct baseline.
+
+    Before today's regular-session close this is yesterday; from the close
+    until midnight it's today itself, since after-hours change % must be
+    measured against the session that just finished, not the prior one.
+    This must stay in sync with `trading_day_key` below - that function
+    decides *when* to refetch prev_close, this decides *what* to fetch, and
+    if they disagree the close-time flip (e.g. 16:00 ET) never triggers a
+    refetch and after-hours prices get compared against yesterday's stale
+    close for the rest of the session.
+    """
+    now = datetime.now(timezone.utc).astimezone(session.zone)
+    return now.date() if now.time() >= session.close else now.date() - timedelta(days=1)
+
+
+def trading_day_key(currency: str) -> str:
+    """Cache-invalidation key for a currency's prev_close baseline.
+
+    Must change at exactly the moments `_reference_session_date` changes
+    (session close, not just midnight) - see that function's docstring.
+    """
+    session = _SESSIONS.get(currency or "")
+    if session is not None:
+        return _reference_session_date(session).isoformat()
+    return date.today().isoformat()
+
+
 class TossInvestClient:
     def __init__(self, client_id: str, client_secret: str, base_url: str) -> None:
         self._client_id = client_id
@@ -186,7 +214,12 @@ class TossInvestClient:
             params["before"] = before
         response = await self._request("GET", "/api/v1/candles", params=params)
         data = response.json()["result"]
-        return [Candle.from_json(item) for item in data["candles"]]
+        # Some symbols (thin/leveraged ETFs especially) report timestamp:
+        # null for candles with no trades, mirroring the /prices quirk -
+        # skip them rather than crashing Candle.from_json's fromisoformat().
+        return [
+            Candle.from_json(item) for item in data["candles"] if item.get("timestamp")
+        ]
 
     async def get_previous_close(
         self, symbol: str, currency: str | None = None
@@ -215,10 +248,7 @@ class TossInvestClient:
     async def _session_close(
         self, symbol: str, session: _MarketSession
     ) -> Decimal | None:
-        now = datetime.now(timezone.utc).astimezone(session.zone)
-        reference_date = (
-            now.date() if now.time() >= session.close else now.date() - timedelta(days=1)
-        )
+        reference_date = _reference_session_date(session)
 
         # Walk back to the most recent actual trading day <= reference_date
         # (skips weekends/holidays, and any stray candle the feed dates

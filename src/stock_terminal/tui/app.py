@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import DataTable, Footer, Header
 
-from stock_terminal.api.client import TossInvestClient
+from stock_terminal.api.client import TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
 from stock_terminal.config import TOSS_API_BASE_URL, WATCHLIST_PATH, Settings, ensure_data_dir
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem
@@ -19,22 +17,6 @@ from stock_terminal.tui.screens.add_symbol import AddSymbolResult, AddSymbolScre
 from stock_terminal.tui.screens.set_alert import AlertResult, SetAlertScreen
 from stock_terminal.tui.widgets.chart_panel import ChartPanel
 from stock_terminal.tui.widgets.watchlist_table import WatchlistTable
-
-_US_EASTERN = ZoneInfo("America/New_York")
-
-
-def _trading_day_key(currency: str) -> str:
-    """Calendar date the market's *current* session belongs to.
-
-    KRX trades within a single KST day, so the local KST date is a fine
-    proxy for "has the trading day rolled over". US markets run from
-    22:30/23:30 KST through 05:00/06:00 KST the next day, so using the KST
-    date would flag an in-progress US session as stale at KST midnight and
-    refetch prev_close mid-session. Anchor USD symbols to US/Eastern instead.
-    """
-    if currency == "USD":
-        return datetime.now(_US_EASTERN).date().isoformat()
-    return date.today().isoformat()
 
 
 class StockTerminalApp(App):
@@ -118,8 +100,19 @@ class StockTerminalApp(App):
         refreshed); without this, change %/amount would keep comparing the
         live price against a stale, ever-older baseline instead of resetting
         to yesterday's close each trading day. Staleness is judged per-market
-        (see _trading_day_key) since KRW and USD symbols roll over at
-        different wall-clock moments.
+        (see client.trading_day_key) since the correct baseline flips twice
+        a day, not once: at the regular-session close (yesterday's close ->
+        today's own close, for after-hours) and again at midnight (today's
+        close -> tomorrow's pre-market baseline). Missing the close-time
+        flip is what left after-hours prices comparing against a stale,
+        already-superseded baseline for the rest of the session.
+
+        One symbol's fetch failing (API error, unexpected candle data, ...)
+        must never abort this loop: it runs inside the same exclusive worker
+        as the live price poll, so an uncaught exception here doesn't just
+        skip that symbol - it kills the worker outright and every symbol's
+        price/change freezes at its last value until the app is restarted.
+        Catch broadly per-symbol rather than trusting only TossAPIError.
         """
         for symbol in symbols:
             item = self.watchlist.items[symbol]
@@ -127,7 +120,7 @@ class StockTerminalApp(App):
                 # Legacy items saved before currency was tracked.
                 try:
                     stocks = await self.client.get_stocks([symbol])
-                except TossAPIError:
+                except Exception:
                     stocks = []
                 if stocks:
                     item.currency = stocks[0].currency
@@ -140,7 +133,7 @@ class StockTerminalApp(App):
                 prev_close = await self.client.get_previous_close(
                     symbol, item.currency
                 )
-            except TossAPIError:
+            except Exception:
                 continue
             self.watchlist.set_prev_close(symbol, prev_close, today)
 

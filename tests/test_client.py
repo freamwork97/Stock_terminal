@@ -9,7 +9,7 @@ import httpx
 import pytest
 import respx
 
-from stock_terminal.api.client import TossInvestClient
+from stock_terminal.api.client import TossInvestClient, trading_day_key
 from stock_terminal.api.exceptions import (
     TossAuthError,
     TossForbiddenError,
@@ -404,3 +404,81 @@ async def test_get_previous_close_usd_uses_16_00_et_closing_auction(
     prev_close = await client.get_previous_close("AMD", "USD")
 
     assert str(prev_close) == "539.69"
+
+
+@respx.mock
+async def test_get_candles_skips_null_timestamp_entries(
+    client: TossInvestClient,
+) -> None:
+    """Thin/leveraged symbols can report timestamp: null for candles with no
+    trades - the same quirk already handled for /prices. A naive
+    datetime.fromisoformat(None) would raise and, left uncaught, permanently
+    kills the price-poll worker (all watchlist rows freeze until restart).
+    Such entries must be dropped instead of crashing the parse."""
+    _token_route()
+
+    respx.get(f"{BASE_URL}/api/v1/candles").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": {
+                    "candles": [
+                        {
+                            "timestamp": None,
+                            "openPrice": "0",
+                            "highPrice": "0",
+                            "lowPrice": "0",
+                            "closePrice": "0",
+                            "volume": "0",
+                        },
+                        {
+                            "timestamp": "2026-07-27T00:00:00+00:00",
+                            "openPrice": "100",
+                            "highPrice": "110",
+                            "lowPrice": "95",
+                            "closePrice": "105",
+                            "volume": "1000",
+                        },
+                    ],
+                    "nextBefore": None,
+                }
+            },
+        )
+    )
+
+    candles = await client.get_candles("KORU", interval="1d", count=5)
+
+    assert len(candles) == 1
+    assert str(candles[0].close) == "105"
+
+
+@pytest.mark.parametrize(
+    "utc_hour, expected",
+    [
+        (19, "2026-07-26"),  # 15:00 ET - before today's 16:00 close
+        (21, "2026-07-27"),  # 17:00 ET - after the close, in after-hours
+    ],
+)
+def test_trading_day_key_flips_at_session_close(
+    monkeypatch: pytest.MonkeyPatch, utc_hour: int, expected: str
+) -> None:
+    """The staleness key that gates prev_close refetching must change the
+    moment the regular session closes, not just at midnight.
+
+    Previously it only tracked the calendar date, so a prev_close cached
+    during today's pre-close hours (baseline: yesterday's close) was never
+    invalidated when the market closed - after-hours change %/amount kept
+    comparing the live price against that stale, already-superseded
+    baseline for the rest of the session instead of today's own close."""
+    import stock_terminal.api.client as client_module
+
+    fixed_now = datetime(2026, 7, 27, utc_hour, 0, tzinfo=timezone.utc)
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.astimezone(tz) if tz else fixed_now
+
+    monkeypatch.setattr(client_module, "datetime", _FrozenDateTime)
+
+    assert trading_day_key("USD") == expected
