@@ -26,6 +26,16 @@ from stock_terminal.api.models import Candle, Price, StockInfo
 TOKEN_REFRESH_MARGIN_SECONDS = 60
 MAX_SYMBOLS_PER_CALL = 200
 
+# /api/v1/market-indicators/* only serves this fixed catalog - no free-text
+# lookup like /api/v1/stocks. KOSPI/KOSDAQ are the only tradeable *indices*
+# in it (the rest are KR treasury bond yields); both trade on the KRX
+# session, so their previous-close uses the same 15:30 KST closing auction
+# as KRW stocks.
+INDEX_CATALOG: dict[str, str] = {
+    "KOSPI": "코스피",
+    "KOSDAQ": "코스닥",
+}
+
 _KST = ZoneInfo("Asia/Seoul")
 _US_EASTERN = ZoneInfo("America/New_York")
 
@@ -221,6 +231,51 @@ class TossInvestClient:
             Candle.from_json(item) for item in data["candles"] if item.get("timestamp")
         ]
 
+    async def get_market_indicator_prices(self, symbols: list[str]) -> list[Price]:
+        if not symbols:
+            return []
+        results: list[Price] = []
+        for batch in _chunk(symbols, MAX_SYMBOLS_PER_CALL):
+            response = await self._request(
+                "GET",
+                "/api/v1/market-indicators/prices",
+                params={"symbols": ",".join(batch)},
+            )
+            data = response.json()
+            results.extend(
+                Price.from_market_indicator_json(item) for item in data["result"]
+            )
+        return results
+
+    async def get_market_indicator_candles(
+        self,
+        symbol: str,
+        interval: str = "1d",
+        count: int = 100,
+        before: str | None = None,
+    ) -> list[Candle]:
+        params = {"interval": interval, "count": count}
+        if before is not None:
+            params["before"] = before
+        response = await self._request(
+            "GET", f"/api/v1/market-indicators/{symbol}/candles", params=params
+        )
+        data = response.json()["result"]
+        return [
+            Candle.from_json(item) for item in data["candles"] if item.get("timestamp")
+        ]
+
+    async def get_index_previous_close(self, symbol: str) -> Decimal | None:
+        """Previous close for a KOSPI/KOSDAQ-style index (see INDEX_CATALOG).
+
+        Both currently-supported indices trade on the KRX session, so this
+        reuses the same closing-auction logic as KRW stocks, just pointed at
+        the market-indicators candle endpoint instead of /api/v1/candles.
+        """
+        return await self._session_close(
+            symbol, _KRX_SESSION, candle_fetcher=self.get_market_indicator_candles
+        )
+
     async def get_previous_close(
         self, symbol: str, currency: str | None = None
     ) -> Decimal | None:
@@ -246,14 +301,19 @@ class TossInvestClient:
         return candles[0].close
 
     async def _session_close(
-        self, symbol: str, session: _MarketSession
+        self,
+        symbol: str,
+        session: _MarketSession,
+        *,
+        candle_fetcher=None,
     ) -> Decimal | None:
+        get_candles = candle_fetcher or self.get_candles
         reference_date = _reference_session_date(session)
 
         # Walk back to the most recent actual trading day <= reference_date
         # (skips weekends/holidays, and any stray candle the feed dates
         # *after* today - e.g. USD after-hours bucketed as tomorrow).
-        candles = await self.get_candles(symbol, interval="1d", count=5)
+        candles = await get_candles(symbol, interval="1d", count=5)
         trading_day = None
         for candle in sorted(candles, key=lambda c: c.timestamp, reverse=True):
             candle_date = candle.timestamp.astimezone(session.zone).date()
@@ -267,7 +327,7 @@ class TossInvestClient:
             trading_day, session.auction_end, tzinfo=session.zone
         ) + timedelta(minutes=1)
         try:
-            minute_candles = await self.get_candles(
+            minute_candles = await get_candles(
                 symbol, interval="1m", count=20, before=window_end.isoformat()
             )
         except TossAPIError:

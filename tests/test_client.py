@@ -452,6 +452,113 @@ async def test_get_candles_skips_null_timestamp_entries(
     assert str(candles[0].close) == "105"
 
 
+@respx.mock
+async def test_get_market_indicator_prices_parses_without_currency_field(
+    client: TossInvestClient,
+) -> None:
+    _token_route()
+    respx.get(f"{BASE_URL}/api/v1/market-indicators/prices").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": [
+                    {
+                        "symbol": "KOSPI",
+                        "timestamp": "2026-07-21T09:30:00+09:00",
+                        "lastPrice": "2650.32",
+                    }
+                ]
+            },
+        )
+    )
+
+    prices = await client.get_market_indicator_prices(["KOSPI"])
+
+    assert prices[0].symbol == "KOSPI"
+    assert prices[0].currency == "PT"
+    assert str(prices[0].last_price) == "2650.32"
+
+
+@respx.mock
+async def test_get_index_previous_close_uses_krx_closing_auction(
+    client: TossInvestClient,
+) -> None:
+    """KOSPI/KOSDAQ share the KRX session close logic with KRW stocks, just
+    against the market-indicators candle endpoint."""
+    _token_route()
+    kst = ZoneInfo("Asia/Seoul")
+    today = datetime.now(kst).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(days=1)
+
+    def candles_side_effect(request: httpx.Request) -> httpx.Response:
+        interval = request.url.params.get("interval")
+        if interval == "1d":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "candles": [
+                            {
+                                "timestamp": today.isoformat(),
+                                "openPrice": "2640",
+                                "highPrice": "2660",
+                                "lowPrice": "2635",
+                                "closePrice": "2650",
+                                "volume": "500000",
+                            },
+                            {
+                                "timestamp": yesterday.isoformat(),
+                                "openPrice": "2600",
+                                "highPrice": "2670",
+                                "lowPrice": "2590",
+                                "closePrice": "2670",
+                                "volume": "600000",
+                            },
+                        ],
+                        "nextBefore": None,
+                    }
+                },
+            )
+
+        base = yesterday.replace(hour=15, minute=20)
+        minute_candles = []
+        for i in range(16):
+            ts = base + timedelta(minutes=i)
+            if i == 11:  # 15:31 KST: the closing single-price auction print.
+                minute_candles.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "openPrice": "2652.10",
+                        "highPrice": "2652.50",
+                        "lowPrice": "2652.10",
+                        "closePrice": "2652.50",
+                        "volume": "50000",
+                    }
+                )
+            else:
+                minute_candles.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "openPrice": "2650",
+                        "highPrice": "2650",
+                        "lowPrice": "2650",
+                        "closePrice": "2650",
+                        "volume": "0",
+                    }
+                )
+        return httpx.Response(
+            200, json={"result": {"candles": minute_candles, "nextBefore": None}}
+        )
+
+    respx.get(f"{BASE_URL}/api/v1/market-indicators/KOSPI/candles").mock(
+        side_effect=candles_side_effect
+    )
+
+    prev_close = await client.get_index_previous_close("KOSPI")
+
+    assert str(prev_close) == "2652.50"
+
+
 @pytest.mark.parametrize(
     "utc_hour, expected",
     [

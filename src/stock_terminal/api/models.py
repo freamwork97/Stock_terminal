@@ -31,6 +31,19 @@ class Price:
             timestamp=datetime.fromisoformat(raw_timestamp) if raw_timestamp else None,
         )
 
+    @classmethod
+    def from_market_indicator_json(cls, data: dict) -> Price:
+        # /api/v1/market-indicators/prices has the same shape as
+        # /api/v1/prices minus "currency" - indices are quoted in points,
+        # not a currency, so callers get the "PT" pseudo-currency instead.
+        raw_timestamp = data["timestamp"]
+        return cls(
+            symbol=data["symbol"],
+            last_price=Decimal(str(data["lastPrice"])),
+            currency="PT",
+            timestamp=datetime.fromisoformat(raw_timestamp) if raw_timestamp else None,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class StockInfo:

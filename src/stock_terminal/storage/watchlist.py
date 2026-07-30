@@ -17,6 +17,7 @@ class WatchlistItem:
     prev_close: Decimal | None = None
     prev_close_date: str | None = None  # ISO date the prev_close was fetched for
     currency: str = ""  # market's trading-day calendar depends on this
+    is_index: bool = False  # routes polling to /api/v1/market-indicators/* instead
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -39,6 +40,7 @@ class WatchlistItem:
             prev_close=dec("prev_close"),
             prev_close_date=data.get("prev_close_date"),
             currency=data.get("currency", ""),
+            is_index=data.get("is_index", False),
         )
 
 

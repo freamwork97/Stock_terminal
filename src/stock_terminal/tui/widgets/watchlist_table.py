@@ -24,7 +24,8 @@ FLASH_STYLE = "reverse bold yellow"
 
 
 def _format_amount(value: Decimal, currency: str, *, signed: bool = False) -> str:
-    """KRW as a whole-won amount ('12,345원'), everything else as USD ('$12.34')."""
+    """KRW as a whole-won amount ('12,345원'), PT (index points) as a bare
+    number ('2,573.45pt'), everything else as USD ('$12.34')."""
     sign = ""
     if signed and value > 0:
         sign = "+"
@@ -34,6 +35,8 @@ def _format_amount(value: Decimal, currency: str, *, signed: bool = False) -> st
 
     if currency == "KRW":
         return f"{sign}{value:,.0f}원"
+    if currency == "PT":
+        return f"{sign}{value:,.2f}pt"
     return f"{sign}${value:,.2f}"
 
 

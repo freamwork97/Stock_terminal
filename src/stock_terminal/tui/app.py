@@ -81,8 +81,12 @@ class StockTerminalApp(App):
         if not symbols:
             return
         await self._refresh_stale_prev_closes(symbols)
+        stock_symbols = [s for s in symbols if not self.watchlist.items[s].is_index]
+        index_symbols = [s for s in symbols if self.watchlist.items[s].is_index]
         try:
-            prices = await self.client.get_prices(symbols)
+            prices = await self.client.get_prices(stock_symbols)
+            if index_symbols:
+                prices += await self.client.get_market_indicator_prices(index_symbols)
             price_map = {p.symbol: p for p in prices}
             triggered = table.apply_prices(price_map, self.watchlist)
             for symbol in triggered:
@@ -116,6 +120,20 @@ class StockTerminalApp(App):
         """
         for symbol in symbols:
             item = self.watchlist.items[symbol]
+
+            if item.is_index:
+                # KOSPI/KOSDAQ both run on the KRX session, same calendar
+                # as KRW stocks - see client.INDEX_CATALOG.
+                today = _trading_day_key("KRW")
+                if item.prev_close_date == today:
+                    continue
+                try:
+                    prev_close = await self.client.get_index_previous_close(symbol)
+                except Exception:
+                    continue
+                self.watchlist.set_prev_close(symbol, prev_close, today)
+                continue
+
             if not item.currency:
                 # Legacy items saved before currency was tracked.
                 try:
@@ -150,10 +168,16 @@ class StockTerminalApp(App):
         symbol = table.selected_symbol
         if not symbol:
             return
+        item = self.watchlist.items.get(symbol)
         try:
-            candles = await self.client.get_candles(
-                symbol, interval=chart.interval, count=100
-            )
+            if item is not None and item.is_index:
+                candles = await self.client.get_market_indicator_candles(
+                    symbol, interval=chart.interval, count=100
+                )
+            else:
+                candles = await self.client.get_candles(
+                    symbol, interval=chart.interval, count=100
+                )
             chart.show_candles(symbol, candles)
         except TossAPIError as exc:
             self.sub_title = f"차트 오류: {exc}"
@@ -173,8 +197,11 @@ class StockTerminalApp(App):
             symbol=result.symbol,
             name=result.name,
             prev_close=result.prev_close,
-            prev_close_date=_trading_day_key(result.currency),
+            prev_close_date=_trading_day_key(
+                "KRW" if result.is_index else result.currency
+            ),
             currency=result.currency,
+            is_index=result.is_index,
         )
         self.watchlist.add(item)
         self.query_one(WatchlistTable).sync_rows(self.watchlist)
@@ -183,7 +210,11 @@ class StockTerminalApp(App):
     @work(exclusive=False, group="refresh-one")
     async def _refresh_one(self, symbol: str) -> None:
         try:
-            prices = await self.client.get_prices([symbol])
+            item = self.watchlist.items.get(symbol)
+            if item is not None and item.is_index:
+                prices = await self.client.get_market_indicator_prices([symbol])
+            else:
+                prices = await self.client.get_prices([symbol])
             table = self.query_one(WatchlistTable)
             table.apply_prices({p.symbol: p for p in prices}, self.watchlist)
         except TossAPIError:

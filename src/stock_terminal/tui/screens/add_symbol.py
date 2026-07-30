@@ -9,8 +9,11 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label
 
-from stock_terminal.api.client import TossInvestClient
+from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient
 from stock_terminal.api.exceptions import TossAPIError
+
+# Lets users type the Korean index name instead of memorizing the API code.
+_INDEX_ALIASES = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}
 
 
 @dataclass(slots=True)
@@ -19,6 +22,7 @@ class AddSymbolResult:
     name: str
     prev_close: object  # Decimal | None, kept loosely typed to avoid import cycle
     currency: str
+    is_index: bool = False
 
 
 class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
@@ -54,7 +58,7 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("종목 추가 (예: 005930, AAPL)")
+            yield Label("종목 추가 (예: 005930, AAPL, KOSPI, KOSDAQ)")
             yield Input(placeholder="심볼 코드 입력", id="symbol-input")
             yield Label("", id="status")
             with Horizontal(id="buttons"):
@@ -76,7 +80,8 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
     async def _lookup(self) -> None:
         status = self.query_one("#status", Label)
         confirm_button = self.query_one("#confirm", Button)
-        symbol = self.query_one("#symbol-input", Input).value.strip().upper()
+        raw = self.query_one("#symbol-input", Input).value.strip().upper()
+        symbol = _INDEX_ALIASES.get(raw, raw)
 
         if not symbol:
             status.update("심볼을 입력하세요.")
@@ -87,6 +92,24 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
         self._verified = None
 
         try:
+            if symbol in INDEX_CATALOG:
+                prices = await self._client.get_market_indicator_prices([symbol])
+                if not prices:
+                    status.update(f"'{symbol}' 지수를 찾을 수 없습니다.")
+                    return
+                name = INDEX_CATALOG[symbol]
+                prev_close = await self._client.get_index_previous_close(symbol)
+                self._verified = AddSymbolResult(
+                    symbol=symbol,
+                    name=name,
+                    prev_close=prev_close,
+                    currency="PT",
+                    is_index=True,
+                )
+                status.update(f"확인됨: {name} (지수)")
+                confirm_button.disabled = False
+                return
+
             stocks = await self._client.get_stocks([symbol])
             if not stocks:
                 status.update(f"'{symbol}' 종목을 찾을 수 없습니다.")
