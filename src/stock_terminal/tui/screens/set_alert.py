@@ -89,6 +89,10 @@ class SetAlertScreen(ModalScreen[AlertResult | None]):
             status.update("숫자만 입력하세요.")
             return
 
+        if any(v is not None and (not v.is_finite() or v <= 0) for v in (upper, lower)):
+            status.update("알림 가격은 유한한 양수여야 합니다.")
+            return
+
         if upper is not None and lower is not None and upper <= lower:
             status.update("상한가는 하한가보다 커야 합니다.")
             return

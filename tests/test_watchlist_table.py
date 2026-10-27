@@ -172,3 +172,21 @@ async def test_estimated_baseline_label(watchlist):
         table.apply_prices({"AAPL": Price("AAPL", Decimal("205"), "USD", None)}, watchlist)
         assert table.get_cell("AAPL", "baseline") == "2026-10-23 일봉 대체 (미확정)"
         assert str(table.get_cell("AAPL", "change_pct")) == "+2.50%"
+
+
+async def test_duplicate_polls_and_failures_do_not_repeat_alert(watchlist):
+    app = _HarnessApp()
+    async with app.run_test():
+        table = app.query_one(WatchlistTable)
+        table.sync_rows(watchlist)
+        price = Price("AAPL", Decimal("215"), "USD", datetime.now(timezone.utc))
+        assert table.apply_prices({"AAPL": price}, watchlist) == ["AAPL"]
+        table.mark_failed(["AAPL"])
+        table.mark_missing(["AAPL"], set())
+        assert table.apply_prices({"AAPL": price}, watchlist) == []
+        assert len(table.alerts.history) == 1
+        del watchlist.items["AAPL"]
+        table.sync_rows(watchlist)
+        watchlist.items["AAPL"] = WatchlistItem("AAPL", alert_upper=Decimal("210"))
+        table.sync_rows(watchlist)
+        assert table.apply_prices({"AAPL": price}, watchlist) == ["AAPL"]

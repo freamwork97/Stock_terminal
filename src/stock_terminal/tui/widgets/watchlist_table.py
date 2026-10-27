@@ -8,6 +8,8 @@ import time
 
 from rich.text import Text
 from textual.widgets import DataTable
+from textual.message import Message
+from stock_terminal.alerts import AlertEvent, AlertTracker
 
 from stock_terminal.api.models import Price
 from stock_terminal.api.client import trading_day_key
@@ -49,9 +51,15 @@ def _format_amount(value: Decimal, currency: str, *, signed: bool = False) -> st
 class WatchlistTable(DataTable):
     """DataTable keyed by symbol; one row per watchlist item."""
 
+    class AlertTriggered(Message):
+        def __init__(self, event: AlertEvent) -> None:
+            super().__init__()
+            self.event = event
+
     def __init__(self, *, stale_after: float = 30.0, **kwargs) -> None:
         super().__init__(**kwargs)
         self.stale_after = stale_after
+        self.alerts = AlertTracker()
         self._received_at: dict[str, float] = {}
         self._states: dict[str, str] = {}
 
@@ -101,6 +109,7 @@ class WatchlistTable(DataTable):
             self.remove_row(symbol)
             self._received_at.pop(symbol, None)
             self._states.pop(symbol, None)
+            self.alerts.reset(symbol)
 
         for symbol in watchlist.symbols:
             if symbol not in existing:
@@ -189,10 +198,11 @@ class WatchlistTable(DataTable):
             self._set_status(symbol, status)
             self.update_cell(symbol, COL_UPDATED, updated_text)
 
-            if item.alert_upper is not None and price.last_price >= item.alert_upper:
+            event = self.alerts.evaluate(symbol, price.last_price, price.currency,
+                                         item.alert_upper, item.alert_lower)
+            if event is not None:
                 triggered.append(symbol)
-            elif item.alert_lower is not None and price.last_price <= item.alert_lower:
-                triggered.append(symbol)
+                self.post_message(self.AlertTriggered(event))
 
         return triggered
 

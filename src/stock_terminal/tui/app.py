@@ -15,6 +15,7 @@ from stock_terminal.api.exceptions import TossAPIError
 from stock_terminal.config import TOSS_API_BASE_URL, WATCHLIST_PATH, Settings, ensure_data_dir
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem
 from stock_terminal.tui.screens.add_symbol import AddSymbolResult, AddSymbolScreen
+from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
 from stock_terminal.tui.screens.set_alert import AlertResult, SetAlertScreen
 from stock_terminal.tui.widgets.chart_panel import ChartPanel
 from stock_terminal.tui.widgets.watchlist_table import WatchlistTable
@@ -29,6 +30,7 @@ class StockTerminalApp(App):
         ("a", "add_symbol", "종목추가"),
         ("d", "delete_symbol", "삭제"),
         ("t", "set_alert", "알림설정"),
+        ("h", "alert_history", "알림이력"),
         ("m", "toggle_chart_mode", "차트모드"),
         ("i", "toggle_interval", "봉주기"),
         ("v", "cycle_view", "화면전환"),
@@ -95,12 +97,8 @@ class StockTerminalApp(App):
             try:
                 prices = await fetch(requested)
                 price_map = {p.symbol: p for p in prices if p.symbol in requested}
-                triggered = table.apply_prices(price_map, self.watchlist)
+                table.apply_prices(price_map, self.watchlist)
                 table.mark_missing(requested, set(price_map))
-                for symbol in triggered:
-                    table.flash(symbol)
-                if triggered:
-                    self.bell()
             except TossAPIError as exc:
                 table.mark_failed(requested)
                 errors.append(str(exc))
@@ -242,7 +240,23 @@ class StockTerminalApp(App):
     def _on_alert_set(self, symbol: str, result: AlertResult | None) -> None:
         if result is None:
             return
+        item = self.watchlist.items.get(symbol)
+        if item is None:
+            return
+        changed = (item.alert_upper, item.alert_lower) != (result.upper, result.lower)
         self.watchlist.set_alerts(symbol, result.upper, result.lower)
+        if changed:
+            self.query_one(WatchlistTable).alerts.reset(symbol)
+
+    def on_watchlist_table_alert_triggered(self, message: WatchlistTable.AlertTriggered) -> None:
+        event = message.event
+        self.query_one(WatchlistTable).flash(event.symbol)
+        self.bell()
+        direction = "상한 이상" if event.direction == "upper" else "하한 이하"
+        self.notify(f"{event.symbol}: {direction} ({event.price} / 기준 {event.threshold})", title="가격 알림")
+
+    def action_alert_history(self) -> None:
+        self.push_screen(AlertHistoryScreen(tuple(self.query_one(WatchlistTable).alerts.history)))
 
     def action_cycle_view(self) -> None:
         idx = self._VIEW_MODES.index(self._view_mode)

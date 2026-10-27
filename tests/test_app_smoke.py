@@ -165,3 +165,106 @@ async def test_baseline_retries_without_marking_failure_complete(fake_settings, 
         assert fetch.await_count == 2
     finally:
         await app.client.aclose()
+
+
+async def test_alert_notifications_history_and_settings(fake_settings, tmp_path, monkeypatch):
+    from decimal import Decimal
+    from unittest.mock import Mock
+    from stock_terminal.api.models import Price
+    from stock_terminal.storage.watchlist import WatchlistItem
+    from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
+    from stock_terminal.tui.screens.set_alert import AlertResult
+    from textual.widgets import DataTable
+
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", tmp_path / "watchlist.json")
+    app = StockTerminalApp(fake_settings)
+    monkeypatch.setattr(app, "poll_prices", lambda: None)
+    monkeypatch.setattr(app, "load_chart", lambda: None)
+    bell = Mock()
+    monkeypatch.setattr(app, "bell", bell)
+    app.watchlist.add(WatchlistItem("AAPL", alert_upper=Decimal("210")))
+    try:
+        async with app.run_test() as pilot:
+            table = app.query_one(WatchlistTable)
+            prices = {"AAPL": Price("AAPL", Decimal("215"), "USD", None)}
+            table.apply_prices(prices, app.watchlist)
+            table.apply_prices(prices, app.watchlist)
+            await pilot.pause()
+            assert bell.call_count == 1
+            app._on_alert_set("AAPL", AlertResult(Decimal("210"), None))
+            table.apply_prices(prices, app.watchlist)
+            await pilot.pause()
+            assert bell.call_count == 1
+            app._on_alert_set("AAPL", AlertResult(Decimal("211"), None))
+            table.apply_prices(prices, app.watchlist)
+            await pilot.pause()
+            assert bell.call_count == 2
+            await pilot.press("h")
+            assert isinstance(app.screen, AlertHistoryScreen)
+            assert app.screen.query_one(DataTable).row_count == 2
+            await pilot.press("escape")
+            assert not isinstance(app.screen, AlertHistoryScreen)
+    finally:
+        await app.client.aclose()
+
+
+async def test_initial_refresh_alert_is_delivered_once(fake_settings, tmp_path, monkeypatch):
+    from decimal import Decimal
+    from unittest.mock import AsyncMock, Mock
+    from stock_terminal.api.models import Price
+    from stock_terminal.storage.watchlist import WatchlistItem
+
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", tmp_path / "watchlist.json")
+    app = StockTerminalApp(fake_settings)
+    monkeypatch.setattr(app, "poll_prices", lambda: None)
+    monkeypatch.setattr(app, "load_chart", lambda: None)
+    monkeypatch.setattr(app.client, "get_prices", AsyncMock(return_value=[Price("AAPL", Decimal("215"), "USD", None)]))
+    bell = Mock()
+    monkeypatch.setattr(app, "bell", bell)
+    app.watchlist.add(WatchlistItem("AAPL", alert_upper=Decimal("210")))
+    try:
+        async with app.run_test() as pilot:
+            await app._refresh_one("AAPL").wait()
+            await pilot.pause()
+            assert bell.call_count == 1
+            await app._refresh_one("AAPL").wait()
+            await pilot.pause()
+            assert bell.call_count == 1
+    finally:
+        await app.client.aclose()
+
+
+@pytest.mark.parametrize("invalid", ["NaN", "sNaN", "Infinity", "-1", "0"])
+async def test_alert_dialog_rejects_invalid_prices(fake_settings, tmp_path, monkeypatch, invalid):
+    from textual.widgets import Input, Label
+    from stock_terminal.tui.screens.set_alert import SetAlertScreen
+
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", tmp_path / "watchlist.json")
+    app = StockTerminalApp(fake_settings)
+    try:
+        async with app.run_test() as pilot:
+            app.push_screen(SetAlertScreen("AAPL", None, None))
+            await pilot.pause()
+            app.screen.query_one("#upper-input", Input).value = invalid
+            await pilot.click("#confirm")
+            assert isinstance(app.screen, SetAlertScreen)
+            assert "유한한 양수" in str(app.screen.query_one("#status", Label).render())
+    finally:
+        await app.client.aclose()
+
+
+async def test_empty_alert_history_opens_and_closes(fake_settings, tmp_path, monkeypatch):
+    from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
+    from textual.widgets import DataTable
+
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", tmp_path / "watchlist.json")
+    app = StockTerminalApp(fake_settings)
+    try:
+        async with app.run_test() as pilot:
+            await pilot.press("h")
+            assert isinstance(app.screen, AlertHistoryScreen)
+            assert app.screen.query_one(DataTable).row_count == 0
+            await pilot.click("#close-history")
+            assert not isinstance(app.screen, AlertHistoryScreen)
+    finally:
+        await app.client.aclose()
