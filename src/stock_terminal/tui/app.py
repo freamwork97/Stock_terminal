@@ -54,7 +54,7 @@ class StockTerminalApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal():
-            yield WatchlistTable(id="watchlist")
+            yield WatchlistTable(id="watchlist", stale_after=max(30.0, self.settings.poll_interval_seconds * 3))
             yield ChartPanel(id="chart")
         yield Footer()
 
@@ -83,19 +83,26 @@ class StockTerminalApp(App):
         await self._refresh_stale_prev_closes(symbols)
         stock_symbols = [s for s in symbols if not self.watchlist.items[s].is_index]
         index_symbols = [s for s in symbols if self.watchlist.items[s].is_index]
-        try:
-            prices = await self.client.get_prices(stock_symbols)
-            if index_symbols:
-                prices += await self.client.get_market_indicator_prices(index_symbols)
-            price_map = {p.symbol: p for p in prices}
-            triggered = table.apply_prices(price_map, self.watchlist)
-            for symbol in triggered:
-                table.flash(symbol)
-            if triggered:
-                self.bell()
-            self.sub_title = ""
-        except TossAPIError as exc:
-            self.sub_title = f"시세 오류: {exc}"
+        errors = []
+        for requested, fetch in (
+            (stock_symbols, self.client.get_prices),
+            (index_symbols, self.client.get_market_indicator_prices),
+        ):
+            if not requested:
+                continue
+            try:
+                prices = await fetch(requested)
+                price_map = {p.symbol: p for p in prices if p.symbol in requested}
+                triggered = table.apply_prices(price_map, self.watchlist)
+                table.mark_missing(requested, set(price_map))
+                for symbol in triggered:
+                    table.flash(symbol)
+                if triggered:
+                    self.bell()
+            except TossAPIError as exc:
+                table.mark_failed(requested)
+                errors.append(str(exc))
+        self.sub_title = f"시세 오류: {'; '.join(errors)}" if errors else ""
 
     async def _refresh_stale_prev_closes(self, symbols: list[str]) -> None:
         """Re-fetch prev_close for items whose baseline predates today.
@@ -216,9 +223,11 @@ class StockTerminalApp(App):
             else:
                 prices = await self.client.get_prices([symbol])
             table = self.query_one(WatchlistTable)
-            table.apply_prices({p.symbol: p for p in prices}, self.watchlist)
+            price_map = {p.symbol: p for p in prices if p.symbol == symbol}
+            table.apply_prices(price_map, self.watchlist)
+            table.mark_missing([symbol], set(price_map))
         except TossAPIError:
-            pass
+            self.query_one(WatchlistTable).mark_failed([symbol])
 
     def action_delete_symbol(self) -> None:
         table = self.query_one(WatchlistTable)

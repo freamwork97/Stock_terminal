@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import datetime, timezone
+import time
 
 from rich.text import Text
 from textual.widgets import DataTable
@@ -16,6 +18,8 @@ COL_PRICE = "price"
 COL_CHANGE = "change"
 COL_CHANGE_PCT = "change_pct"
 COL_UPDATED = "updated"
+COL_RECEIVED = "received"
+COL_STATUS = "status"
 
 UP_STYLE = "bold green"
 DOWN_STYLE = "bold red"
@@ -43,14 +47,43 @@ def _format_amount(value: Decimal, currency: str, *, signed: bool = False) -> st
 class WatchlistTable(DataTable):
     """DataTable keyed by symbol; one row per watchlist item."""
 
+    def __init__(self, *, stale_after: float = 30.0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.stale_after = stale_after
+        self._received_at: dict[str, float] = {}
+        self._states: dict[str, str] = {}
+
+    def refresh_freshness(self) -> None:
+        for symbol, received in self._received_at.items():
+            if (symbol in self.rows and time.monotonic() - received > self.stale_after
+                    and self._states.get(symbol) not in ("조회 실패", "응답 누락")):
+                self._set_status(symbol, "수신 지연")
+
+    def _set_status(self, symbol: str, status: str) -> None:
+        if symbol in self.rows:
+            self._states[symbol] = status
+            self.update_cell(symbol, COL_STATUS, Text(status, style="green" if status == "정상" else "yellow"))
+
+    def mark_failed(self, symbols: list[str]) -> None:
+        for symbol in symbols:
+            self._set_status(symbol, "조회 실패")
+
+    def mark_missing(self, symbols: list[str], received: set[str]) -> None:
+        for symbol in symbols:
+            if symbol not in received:
+                self._set_status(symbol, "응답 누락")
+
     def on_mount(self) -> None:
         self.cursor_type = "row"
         self.add_column("심볼", key=COL_SYMBOL, width=10)
+        self.add_column("상태", key=COL_STATUS, width=14)
         self.add_column("종목명", key=COL_NAME, width=18)
         self.add_column("현재가", key=COL_PRICE, width=14)
         self.add_column("등락", key=COL_CHANGE, width=12)
         self.add_column("등락률", key=COL_CHANGE_PCT, width=10)
-        self.add_column("갱신시각", key=COL_UPDATED, width=10)
+        self.add_column("체결시각 (로컬)", key=COL_UPDATED, width=19)
+        self.add_column("수신시각 (로컬)", key=COL_RECEIVED, width=19)
+        self.set_interval(1.0, self.refresh_freshness)
 
     def sync_rows(self, watchlist: Watchlist) -> None:
         """Add/remove rows so the table matches the current watchlist.
@@ -63,13 +96,17 @@ class WatchlistTable(DataTable):
 
         for symbol in existing - wanted:
             self.remove_row(symbol)
+            self._received_at.pop(symbol, None)
+            self._states.pop(symbol, None)
 
         for symbol in watchlist.symbols:
             if symbol not in existing:
                 item = watchlist.items[symbol]
                 self.add_row(
                     item.symbol,
+                    "대기",
                     item.name or item.symbol,
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -120,9 +157,20 @@ class WatchlistTable(DataTable):
             self.update_cell(
                 symbol, COL_CHANGE_PCT, Text(change_pct_text, style=style)
             )
-            updated_text = (
-                price.timestamp.strftime("%H:%M:%S") if price.timestamp else "-"
-            )
+            now = datetime.now(timezone.utc)
+            self._received_at[symbol] = time.monotonic()
+            self.update_cell(symbol, COL_RECEIVED, now.astimezone().strftime("%m-%d %H:%M:%S"))
+            timestamp = price.timestamp
+            if timestamp is None or timestamp.tzinfo is None:
+                status = "체결시각 불명"
+                updated_text = "-"
+            else:
+                age = (now - timestamp).total_seconds()
+                status = "체결 오래됨" if age > self.stale_after else "정상"
+                if age < -5:
+                    status = "체결시각 이상"
+                updated_text = timestamp.astimezone().strftime("%m-%d %H:%M:%S")
+            self._set_status(symbol, status)
             self.update_cell(symbol, COL_UPDATED, updated_text)
 
             if item.alert_upper is not None and price.last_price >= item.alert_upper:

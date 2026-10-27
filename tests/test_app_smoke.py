@@ -91,3 +91,38 @@ async def test_polling_recovers_after_failure(fake_settings, tmp_path, monkeypat
                 assert app.sub_title == ""
     finally:
         await app.client.aclose()
+
+
+async def test_partial_market_failure_and_missing_response(fake_settings, tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from stock_terminal.api.exceptions import TossAPIError
+    from stock_terminal.api.models import Price
+    from stock_terminal.storage.watchlist import WatchlistItem
+
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", tmp_path / "watchlist.json")
+    app = StockTerminalApp(fake_settings)
+    monkeypatch.setattr(app, "poll_prices", lambda: None)
+    monkeypatch.setattr(app, "load_chart", lambda: None)
+    monkeypatch.setattr(app, "_refresh_stale_prev_closes", AsyncMock())
+    for symbol in ["AAPL", "KOSPI"]:
+        app.watchlist.add(WatchlistItem(symbol=symbol, is_index=symbol == "KOSPI"))
+    monkeypatch.setattr(app.client, "get_prices", AsyncMock(side_effect=TossAPIError("offline")))
+    monkeypatch.setattr(app.client, "get_market_indicator_prices", AsyncMock(return_value=[
+        Price("KOSPI", Decimal("2500"), "PT", datetime.now(timezone.utc))]))
+    try:
+        async with app.run_test():
+            table = app.query_one(WatchlistTable)
+            await app._refresh_prices(table)
+            assert str(table.get_cell("AAPL", "status")) == "조회 실패"
+            assert str(table.get_cell("KOSPI", "status")) == "정상"
+            monkeypatch.setattr(app.client, "get_prices", AsyncMock(return_value=[]))
+            await app._refresh_prices(table)
+            assert str(table.get_cell("AAPL", "status")) == "응답 누락"
+            monkeypatch.setattr(app.client, "get_prices", AsyncMock(return_value=[
+                Price("AAPL", Decimal("123"), "USD", datetime.now(timezone.utc))]))
+            await app._refresh_prices(table)
+            assert str(table.get_cell("AAPL", "status")) == "정상"
+    finally:
+        await app.client.aclose()
