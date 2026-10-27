@@ -12,6 +12,7 @@ from textual.widgets import DataTable, Footer, Header, Input, Static, Button
 
 from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
+from stock_terminal.polling import PollingHealth
 from stock_terminal.diagnostics import HealthReporter, record
 from textual.worker import Worker, WorkerState
 from stock_terminal.config import TOSS_API_BASE_URL, WATCHLIST_PATH, Settings, ensure_data_dir
@@ -57,6 +58,7 @@ class StockTerminalApp(App):
         super().__init__()
         self.settings = settings
         self._health = HealthReporter()
+        self._poll_health = PollingHealth()
         ensure_data_dir()
         self.watchlist = Watchlist.load(WATCHLIST_PATH)
         self.client = TossInvestClient(
@@ -81,6 +83,7 @@ class StockTerminalApp(App):
             yield Button("종목 조회", id="search-lookup", variant="primary")
             yield Button("관심목록에 추가", id="search-add", variant="success", disabled=True)
         yield Static("", id="summary")
+        yield Static("", id="poll-status")
         with Horizontal(id="panels"):
             yield WatchlistTable(id="watchlist", stale_after=max(30.0, self.settings.poll_interval_seconds * 3))
             yield ChartPanel(id="chart")
@@ -105,6 +108,9 @@ class StockTerminalApp(App):
         self.poll_prices()
         self.poll_baselines()
         self.poll_chart()
+        self._update_poll_status()
+        self.set_interval(1.0, self._update_poll_status)
+        self.set_interval(60.0, self._log_poll_status)
 
     async def on_unmount(self) -> None:
         workers = list(self.workers)
@@ -138,6 +144,18 @@ class StockTerminalApp(App):
         items = dict(self.watchlist.items)
         if not items:
             return
+        self._poll_health.begin()
+        cancelled = False
+        try:
+            await self._fetch_price_groups(table, items)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            self._poll_health.finish(cancelled=cancelled)
+            self._update_poll_status()
+
+    async def _fetch_price_groups(self, table: WatchlistTable, items: dict[str, WatchlistItem]) -> None:
         stock_symbols = [s for s, item in items.items() if not item.is_index]
         index_symbols = [s for s, item in items.items() if item.is_index]
         errors = []
@@ -152,10 +170,12 @@ class StockTerminalApp(App):
                 prices = await fetch(requested)
                 current = {s for s in requested if self.watchlist.items.get(s) is items[s]}
                 price_map = {p.symbol: p for p in prices if p.symbol in current}
+                self._poll_health.receive(len(price_map), missing=len(current - price_map.keys()))
                 table.apply_prices(price_map, self.watchlist)
                 table.mark_missing(list(current), set(price_map))
                 self._health.report(operation, missing=len(current - price_map.keys()))
             except TossAPIError as exc:
+                self._poll_health.receive(0, failure=sum(self.watchlist.items.get(s) is items[s] for s in requested))
                 self._health.report(operation, error=exc)
                 table.mark_failed([s for s in requested if self.watchlist.items.get(s) is items[s]])
                 errors.append(str(exc))
@@ -411,6 +431,24 @@ class StockTerminalApp(App):
 
     def action_alert_history(self) -> None:
         self.push_screen(AlertHistoryScreen(tuple(self.query_one(WatchlistTable).alerts.history)))
+
+    def _update_poll_status(self) -> None:
+        if not self.query("#poll-status"):
+            return
+        snapshot = self._poll_health.snapshot(self.settings.poll_interval_seconds, bool(self.watchlist.items))
+        labels = {"idle": "대기", "normal": "정상", "fetching": "조회 중", "slow": "폴링 지연",
+                  "stalled": "갱신 중단 의심", "no_data": "수신 대기·지연", "failed": "조회 실패·누락"}
+        received = self._poll_health.last_received
+        received_text = received.astimezone().strftime("%m-%d %H:%M:%S") if received else "없음"
+        message = (f"시세 {labels[snapshot['state']]} · 조회 {snapshot['duration_seconds']:.1f}초 "
+                   f"/ 주기 {self.settings.poll_interval_seconds:g}초 · 마지막 수신 {received_text}")
+        status = self.query_one("#poll-status", Static)
+        status.update(message)
+        status.set_class(snapshot["state"] in ("slow", "stalled", "failed", "no_data"), "warning")
+
+    def _log_poll_status(self) -> None:
+        record("poll_status", "runtime", metrics=self._poll_health.snapshot(
+            self.settings.poll_interval_seconds, bool(self.watchlist.items)))
 
     def _update_summary(self) -> None:
         if not self.query("#summary") or not self.query(WatchlistTable):

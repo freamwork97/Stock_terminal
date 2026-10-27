@@ -15,7 +15,7 @@ LOGGER.addHandler(logging.NullHandler())
 
 EVENTS = {"app_started", "app_stopped", "app_crashed", "startup_failed", "operation_failed",
           "operation_recovered", "baseline_updated", "baseline_retry", "watchlist_recovered",
-          "preferences_invalid", "worker_failed"}
+          "preferences_invalid", "worker_failed", "poll_status"}
 OPERATIONS = {"runtime", "configuration", "watchlist", "preferences", "stock_prices",
               "index_prices", "chart", "baseline", "single_price", "search", "worker"}
 
@@ -84,7 +84,7 @@ def error_details(error: BaseException) -> tuple[str, int | None]:
 
 
 def record(event: str, operation: str, *, error: BaseException | None = None,
-           count: int | None = None, delay: float | None = None) -> None:
+           count: int | None = None, delay: float | None = None, metrics: dict | None = None) -> None:
     if event not in EVENTS or operation not in OPERATIONS:
         return
     payload = {"time_utc": datetime.now(timezone.utc).isoformat(), "event": event, "operation": operation}
@@ -97,6 +97,22 @@ def record(event: str, operation: str, *, error: BaseException | None = None,
         payload["count"] = count
     if type(delay) in (int, float) and math.isfinite(delay) and delay >= 0:
         payload["retry_seconds"] = delay
+    if event == "poll_status" and isinstance(metrics, dict):
+        for key in ("poll_count", "success_count", "failure_count", "missing_count", "cancelled_count"):
+            value = metrics.get(key)
+            if type(value) is int and value >= 0:
+                payload[key] = value
+        for key in ("duration_seconds", "receive_age_seconds"):
+            value = metrics.get(key)
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                payload[key] = value
+        if metrics.get("state") in ("idle", "normal", "fetching", "slow", "stalled", "no_data", "failed"):
+            payload["state"] = metrics["state"]
+        if type(metrics.get("poll_in_progress")) is bool:
+            payload["poll_in_progress"] = metrics["poll_in_progress"]
+        received = metrics.get("last_received_utc")
+        if isinstance(received, datetime) and received.tzinfo is not None:
+            payload["last_received_utc"] = received.astimezone(timezone.utc).isoformat()
     # No exception messages, tracebacks, URLs, headers, bodies or symbol input.
     LOGGER.log(logging.WARNING if error is not None or event.endswith(("failed", "retry")) else logging.INFO,
                json.dumps(payload, ensure_ascii=False))
