@@ -26,6 +26,11 @@ class ChartPanel(PlotextPlot):
         self.plt.date_form(_DATE_FORM_1D)
         self._show_placeholder("종목을 선택하세요 (관심목록에서 커서 이동)")
 
+    def clear_chart(self, message: str) -> None:
+        self.symbol = None
+        self._candles = []
+        self._show_placeholder(message)
+
     def toggle_interval(self) -> None:
         self.interval = "1m" if self.interval == "1d" else "1d"
 

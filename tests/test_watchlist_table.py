@@ -190,3 +190,38 @@ async def test_duplicate_polls_and_failures_do_not_repeat_alert(watchlist):
         watchlist.items["AAPL"] = WatchlistItem("AAPL", alert_upper=Decimal("210"))
         table.sync_rows(watchlist)
         assert table.apply_prices({"AAPL": price}, watchlist) == ["AAPL"]
+
+
+async def test_filter_keeps_prices_and_alert_state_for_hidden_symbols(watchlist):
+    app = _HarnessApp()
+    async with app.run_test():
+        table = app.query_one(WatchlistTable)
+        table.sync_rows(watchlist)
+        table.filter_text = "삼성"
+        table.sync_rows(watchlist)
+        assert table.row_count == 1
+        assert table.selected_symbol == "005930"
+        price = Price("AAPL", Decimal("215"), "USD", datetime.now(timezone.utc))
+        assert table.apply_prices({"AAPL": price}, watchlist) == ["AAPL"]
+        received = table._cached_rows["AAPL"]["received"]
+        table.filter_text = ""
+        table.sync_rows(watchlist)
+        assert table.row_count == 2
+        assert "$215.00" in str(table.get_cell("AAPL", "price"))
+        assert table.get_cell("AAPL", "received") == received
+        assert table.apply_prices({"AAPL": price}, watchlist) == []
+
+
+async def test_numeric_sort_preserves_selected_symbol(watchlist):
+    app = _HarnessApp()
+    async with app.run_test():
+        table = app.query_one(WatchlistTable)
+        table.sync_rows(watchlist)
+        selected = table.selected_symbol
+        table.apply_prices({"AAPL": Price("AAPL", Decimal("240"), "USD", None),
+            "005930": Price("005930", Decimal("77000"), "KRW", None)}, watchlist)
+        table.sort_mode = "등락률순"
+        table.sort_rows()
+        assert table.get_row_index("AAPL") == 0
+        assert table.selected_symbol == selected
+        assert "≥$210.00" in table.get_cell("AAPL", "alert")

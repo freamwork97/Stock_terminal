@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import time
 
-from textual import work
+from textual import work, events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import DataTable, Footer, Header
+from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from stock_terminal.api.client import TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
@@ -29,11 +29,16 @@ class StockTerminalApp(App):
     BINDINGS = [
         ("a", "add_symbol", "종목추가"),
         ("d", "delete_symbol", "삭제"),
+        ("u", "undo_delete", "삭제취소"),
         ("t", "set_alert", "알림설정"),
         ("h", "alert_history", "알림이력"),
         ("m", "toggle_chart_mode", "차트모드"),
         ("i", "toggle_interval", "봉주기"),
         ("v", "cycle_view", "화면전환"),
+        ("r", "refresh_now", "새로고침"),
+        ("s", "sort_watchlist", "정렬"),
+        ("slash", "focus_filter", "검색"),
+        ("escape", "clear_filter", "검색해제"),
         ("q", "quit", "종료"),
     ]
 
@@ -53,13 +58,16 @@ class StockTerminalApp(App):
             settings.client_id, settings.client_secret, TOSS_API_BASE_URL
         )
         self._view_mode = "both"
+        self._deleted_item: WatchlistItem | None = None
         self._baseline_retry: dict[str, tuple[str, float]] = {}
         self._baseline_failures: dict[str, int] = {}
         self._baseline_slots = asyncio.Semaphore(3)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Horizontal():
+        yield Input(placeholder="심볼·종목명 검색 (/ 포커스, Esc 해제)", id="filter")
+        yield Static("", id="summary")
+        with Horizontal(id="panels"):
             yield WatchlistTable(id="watchlist", stale_after=max(30.0, self.settings.poll_interval_seconds * 3))
             yield ChartPanel(id="chart")
         yield Footer()
@@ -67,6 +75,8 @@ class StockTerminalApp(App):
     async def on_mount(self) -> None:
         table = self.query_one(WatchlistTable)
         table.sync_rows(self.watchlist)
+        self._update_summary()
+        table.focus()
         if self.watchlist.recovery_notice:
             self.notify(self.watchlist.recovery_notice, title="관심목록 복구", severity="warning", timeout=20)
         self.poll_prices()
@@ -117,7 +127,8 @@ class StockTerminalApp(App):
             except TossAPIError as exc:
                 table.mark_failed(requested)
                 errors.append(str(exc))
-        self.sub_title = f"시세 오류: {'; '.join(errors)}" if errors else ""
+        table.border_subtitle = f"시세 오류: {'; '.join(errors)}" if errors else ""
+        self._update_summary()
 
     @work(exclusive=True, group="baselines")
     async def poll_baselines(self) -> None:
@@ -207,20 +218,27 @@ class StockTerminalApp(App):
         chart = self.query_one(ChartPanel)
         symbol = table.selected_symbol
         if not symbol:
+            chart.clear_chart("표시할 종목 없음 — a: 추가 / Esc: 검색 해제")
             return
         item = self.watchlist.items.get(symbol)
+        interval = chart.interval
+        chart.clear_chart(f"{symbol} 차트 조회 중…")
         try:
             if item is not None and item.is_index:
                 candles = await self.client.get_market_indicator_candles(
-                    symbol, interval=chart.interval, count=100
+                    symbol, interval=interval, count=100
                 )
             else:
                 candles = await self.client.get_candles(
-                    symbol, interval=chart.interval, count=100
+                    symbol, interval=interval, count=100
                 )
-            chart.show_candles(symbol, candles)
+            if table.selected_symbol == symbol and chart.interval == interval:
+                chart.show_candles(symbol, candles)
+                chart.border_subtitle = ""
         except TossAPIError as exc:
-            self.sub_title = f"차트 오류: {exc}"
+            if table.selected_symbol == symbol and chart.interval == interval:
+                chart.clear_chart(f"{symbol} 차트 조회 실패 — r: 재시도")
+                chart.border_subtitle = str(exc)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self.load_chart()
@@ -232,6 +250,9 @@ class StockTerminalApp(App):
 
     def _on_symbol_added(self, result: AddSymbolResult | None) -> None:
         if result is None:
+            return
+        if result.symbol in self.watchlist.items:
+            self.notify(f"{result.symbol}은 이미 관심목록에 있습니다.")
             return
         item = WatchlistItem(
             symbol=result.symbol,
@@ -251,6 +272,7 @@ class StockTerminalApp(App):
         if not self._persist(self.watchlist.add, item):
             return
         self.query_one(WatchlistTable).sync_rows(self.watchlist)
+        self._update_summary()
         self._refresh_one(result.symbol)
 
     @work(exclusive=False, group="refresh-one")
@@ -273,11 +295,30 @@ class StockTerminalApp(App):
         symbol = table.selected_symbol
         if not symbol:
             return
+        deleted = self.watchlist.items[symbol]
         if not self._persist(self.watchlist.remove, symbol):
             return
+        self._deleted_item = deleted
+        self.notify(f"{symbol} 삭제됨 — u 키로 취소", timeout=5)
         self._baseline_retry.pop(symbol, None)
         self._baseline_failures.pop(symbol, None)
         table.sync_rows(self.watchlist)
+        self._update_summary()
+        self.load_chart()
+
+    def action_undo_delete(self) -> None:
+        item = self._deleted_item
+        if item is None:
+            self.notify("취소할 삭제가 없습니다.", timeout=2)
+            return
+        if item.symbol in self.watchlist.items:
+            self.notify("이미 관심목록에 있는 종목입니다.", timeout=2)
+            return
+        if self._persist(self.watchlist.add, item):
+            self._deleted_item = None
+            self.query_one(WatchlistTable).sync_rows(self.watchlist)
+            self._update_summary()
+            self._refresh_one(item.symbol)
 
     def action_set_alert(self) -> None:
         table = self.query_one(WatchlistTable)
@@ -304,6 +345,7 @@ class StockTerminalApp(App):
             return
         if changed:
             self.query_one(WatchlistTable).alerts.reset(symbol)
+        self.query_one(WatchlistTable).sync_rows(self.watchlist)
 
     def on_watchlist_table_alert_triggered(self, message: WatchlistTable.AlertTriggered) -> None:
         event = message.event
@@ -314,6 +356,53 @@ class StockTerminalApp(App):
 
     def action_alert_history(self) -> None:
         self.push_screen(AlertHistoryScreen(tuple(self.query_one(WatchlistTable).alerts.history)))
+
+    def _update_summary(self) -> None:
+        if not self.query("#summary") or not self.query(WatchlistTable):
+            return
+        table = self.query_one(WatchlistTable)
+        message = (f"관심종목 {table.row_count}/{len(self.watchlist.items)} · {table.sort_mode} · "
+                   "a 추가 | t 가격알림 | h 이력 | r 새로고침")
+        if not self.watchlist.items:
+            message = "관심종목이 없습니다 — a 키로 종목을 추가하세요."
+        elif not table.row_count:
+            message = "검색 결과가 없습니다 — Esc 키로 검색을 해제하세요."
+        self.query_one("#summary", Static).update(message)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter":
+            table = self.query_one(WatchlistTable)
+            table.filter_text = event.value
+            table.sync_rows(self.watchlist)
+            self._update_summary()
+            self.load_chart()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "filter":
+            self.query_one(WatchlistTable).focus()
+
+    def action_focus_filter(self) -> None:
+        self.query_one("#filter", Input).focus()
+
+    def action_clear_filter(self) -> None:
+        self.query_one("#filter", Input).value = ""
+        self.query_one(WatchlistTable).focus()
+
+    def action_sort_watchlist(self) -> None:
+        table = self.query_one(WatchlistTable)
+        modes = ["등록순", "심볼순", "등락률순"]
+        table.sort_mode = modes[(modes.index(table.sort_mode) + 1) % len(modes)]
+        table.sort_rows()
+        self._update_summary()
+
+    def action_refresh_now(self) -> None:
+        self.poll_prices()
+        self.load_chart()
+        self.notify("현재가와 차트를 새로고침합니다.", timeout=1.5)
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self.query("#panels"):
+            self.query_one("#panels").set_class(event.size.width < 150, "narrow")
 
     def action_cycle_view(self) -> None:
         idx = self._VIEW_MODES.index(self._view_mode)

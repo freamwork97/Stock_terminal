@@ -20,6 +20,8 @@ class AlertResult:
 class SetAlertScreen(ModalScreen[AlertResult | None]):
     """Prompt for upper/lower alert prices; blank clears that threshold."""
 
+    BINDINGS = [("escape", "dismiss", "취소")]
+
     DEFAULT_CSS = """
     SetAlertScreen {
         align: center middle;

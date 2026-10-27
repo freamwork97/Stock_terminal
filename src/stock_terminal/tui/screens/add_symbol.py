@@ -31,6 +31,8 @@ class AddSymbolResult:
 class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
     """Prompt for a symbol code, verify it exists, then return it for adding."""
 
+    BINDINGS = [("escape", "dismiss", "취소")]
+
     DEFAULT_CSS = """
     AddSymbolScreen {
         align: center middle;
@@ -69,6 +71,12 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
                 yield Button("추가", id="confirm", variant="success", disabled=True)
                 yield Button("취소", id="cancel")
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self.workers.cancel_all()
+        self._verified = None
+        self.query_one("#confirm", Button).disabled = True
+        self.query_one("#status", Label).update("")
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.run_worker(self._lookup(), exclusive=True)
 
@@ -101,7 +109,7 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
                     status.update(f"'{symbol}' 지수를 찾을 수 없습니다.")
                     return
                 name = INDEX_CATALOG[symbol]
-                reference = await self._client.get_close_reference(symbol, "KRW", is_index=True)
+                reference = None  # Baseline refresh runs independently after adding.
                 self._verified = AddSymbolResult(
                     symbol=symbol,
                     name=name,
@@ -119,7 +127,7 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
                 status.update(f"'{symbol}' 종목을 찾을 수 없습니다.")
                 return
             info = stocks[0]
-            reference = await self._client.get_close_reference(symbol, info.currency)
+            reference = None  # Do not delay adding a symbol for candle requests.
             self._verified = AddSymbolResult(
                 symbol=info.symbol,
                 name=info.name,

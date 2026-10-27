@@ -24,6 +24,7 @@ COL_UPDATED = "updated"
 COL_RECEIVED = "received"
 COL_STATUS = "status"
 COL_BASELINE = "baseline"
+COL_ALERT = "alert"
 
 UP_STYLE = "bold green"
 DOWN_STYLE = "bold red"
@@ -60,19 +61,43 @@ class WatchlistTable(DataTable):
         super().__init__(**kwargs)
         self.stale_after = stale_after
         self.alerts = AlertTracker()
+        self.filter_text = ""
+        self.sort_mode = "등록순"
+        self._cached_rows: dict[str, dict] = {}
+        self._order: list[str] = []
         self._received_at: dict[str, float] = {}
         self._states: dict[str, str] = {}
 
+    def _put(self, symbol, column, value) -> None:
+        self._cached_rows.setdefault(symbol, {})[column] = value
+        if symbol in self.rows:
+            self.update_cell(symbol, column, value)
+
+    def sort_rows(self) -> None:
+        selected = self.selected_symbol
+        if self.sort_mode == "등록순":
+            positions = {symbol: i for i, symbol in enumerate(self._order)}
+            self.sort(COL_SYMBOL, key=lambda cell: positions.get(str(cell), len(positions)))
+        elif self.sort_mode == "심볼순":
+            self.sort(COL_SYMBOL, key=str)
+        else:
+            def change(cell):
+                value = str(cell).strip().rstrip("%")
+                return Decimal(value) if value != "-" else Decimal("-Infinity")
+            self.sort(COL_CHANGE_PCT, key=change, reverse=True)
+        if selected in self.rows:
+            self.move_cursor(row=self.get_row_index(selected), animate=False)
+
     def refresh_freshness(self) -> None:
         for symbol, received in self._received_at.items():
-            if (symbol in self.rows and time.monotonic() - received > self.stale_after
+            if (time.monotonic() - received > self.stale_after
                     and self._states.get(symbol) not in ("조회 실패", "응답 누락")):
                 self._set_status(symbol, "수신 지연")
 
     def _set_status(self, symbol: str, status: str) -> None:
-        if symbol in self.rows:
+        if symbol in self._order:
             self._states[symbol] = status
-            self.update_cell(symbol, COL_STATUS, Text(status, style="green" if status == "정상" else "yellow"))
+            self._put(symbol, COL_STATUS, Text(status, style="green" if status == "정상" else "yellow"))
 
     def mark_failed(self, symbols: list[str]) -> None:
         for symbol in symbols:
@@ -91,6 +116,7 @@ class WatchlistTable(DataTable):
         self.add_column("현재가", key=COL_PRICE, width=14)
         self.add_column("등락", key=COL_CHANGE, width=12)
         self.add_column("등락률", key=COL_CHANGE_PCT, width=10)
+        self.add_column("가격 알림", key=COL_ALERT, width=24)
         self.add_column("기준 종가", key=COL_BASELINE, width=32)
         self.add_column("체결시각 (로컬)", key=COL_UPDATED, width=19)
         self.add_column("수신시각 (로컬)", key=COL_RECEIVED, width=19)
@@ -102,30 +128,36 @@ class WatchlistTable(DataTable):
         New rows are added in watchlist order (i.e. the order symbols were
         added), not set-iteration order, so the table stays stable across runs.
         """
-        existing = set(self.rows.keys())
-        wanted = set(watchlist.symbols)
-
-        for symbol in existing - wanted:
-            self.remove_row(symbol)
-            self._received_at.pop(symbol, None)
-            self._states.pop(symbol, None)
-            self.alerts.reset(symbol)
-
+        selected = self.selected_symbol
+        self._order = watchlist.symbols
+        query = self.filter_text.casefold().strip()
+        wanted = {symbol for symbol, item in watchlist.items.items()
+                  if query in symbol.casefold() or query in item.name.casefold()}
+        for symbol in list(self._cached_rows):
+            if symbol not in watchlist.items:
+                self._cached_rows.pop(symbol, None)
+                self._received_at.pop(symbol, None)
+                self._states.pop(symbol, None)
+                self.alerts.reset(symbol)
+        for row in list(self.rows):
+            if row.value not in wanted:
+                self.remove_row(row)
         for symbol in watchlist.symbols:
-            if symbol not in existing:
-                item = watchlist.items[symbol]
-                self.add_row(
-                    item.symbol,
-                    "대기",
-                    item.name or item.symbol,
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    key=symbol,
-                )
+            item = watchlist.items[symbol]
+            cache = self._cached_rows.setdefault(symbol, {})
+            cache[COL_ALERT] = " / ".join(
+                label + _format_amount(value, "PT" if item.is_index else item.currency)
+                for label, value in (("≥", item.alert_upper), ("≤", item.alert_lower)) if value is not None
+            ) or "없음"
+            if symbol in wanted:
+                if symbol not in self.rows:
+                    defaults = {COL_SYMBOL: symbol, COL_STATUS: "대기", COL_NAME: item.name or symbol}
+                    self.add_row(*(cache.get(column.value, defaults.get(column.value, "-"))
+                                   for column in self.columns), key=symbol)
+                self._put(symbol, COL_ALERT, cache[COL_ALERT])
+        self.sort_rows()
+        if selected in self.rows:
+            self.move_cursor(row=self.get_row_index(selected), animate=False)
 
     @property
     def selected_symbol(self) -> str | None:
@@ -145,7 +177,7 @@ class WatchlistTable(DataTable):
 
         for symbol, price in prices.items():
             item = watchlist.items.get(symbol)
-            if item is None or symbol not in self.rows:
+            if item is None:
                 continue
 
             prev_close = item.prev_close
@@ -163,7 +195,7 @@ class WatchlistTable(DataTable):
                 source_label = {"minute_estimate": "분봉 추정", "daily_fallback": "일봉 대체"}.get(item.prev_close_source, "출처 불명")
                 certainty = "확정" if item.prev_close_confirmed else "미확정"
                 baseline_label = f"{item.prev_close_session or '?'} {source_label} ({certainty})"
-            self.update_cell(symbol, COL_BASELINE, baseline_label)
+            self._put(symbol, COL_BASELINE, baseline_label)
 
             if usable:
                 change = price.last_price - prev_close
@@ -173,18 +205,18 @@ class WatchlistTable(DataTable):
                 change_text = _format_amount(change, price.currency, signed=True)
                 change_pct_text = f"{sign}{change_pct:.2f}%"
 
-            self.update_cell(
+            self._put(
                 symbol,
                 COL_PRICE,
                 Text(_format_amount(price.last_price, price.currency), style=style),
             )
-            self.update_cell(symbol, COL_CHANGE, Text(change_text, style=style))
-            self.update_cell(
+            self._put(symbol, COL_CHANGE, Text(change_text, style=style))
+            self._put(
                 symbol, COL_CHANGE_PCT, Text(change_pct_text, style=style)
             )
             now = datetime.now(timezone.utc)
             self._received_at[symbol] = time.monotonic()
-            self.update_cell(symbol, COL_RECEIVED, now.astimezone().strftime("%m-%d %H:%M:%S"))
+            self._put(symbol, COL_RECEIVED, now.astimezone().strftime("%m-%d %H:%M:%S"))
             timestamp = price.timestamp
             if timestamp is None or timestamp.tzinfo is None:
                 status = "체결시각 불명"
@@ -196,7 +228,7 @@ class WatchlistTable(DataTable):
                     status = "체결시각 이상"
                 updated_text = timestamp.astimezone().strftime("%m-%d %H:%M:%S")
             self._set_status(symbol, status)
-            self.update_cell(symbol, COL_UPDATED, updated_text)
+            self._put(symbol, COL_UPDATED, updated_text)
 
             event = self.alerts.evaluate(symbol, price.last_price, price.currency,
                                          item.alert_upper, item.alert_lower)
@@ -204,6 +236,7 @@ class WatchlistTable(DataTable):
                 triggered.append(symbol)
                 self.post_message(self.AlertTriggered(event))
 
+        self.sort_rows()
         return triggered
 
     def flash(self, symbol: str) -> None:
