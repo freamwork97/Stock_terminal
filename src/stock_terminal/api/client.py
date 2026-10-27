@@ -23,7 +23,7 @@ from stock_terminal.api.exceptions import (
     TossForbiddenError,
     TossRateLimitError,
 )
-from stock_terminal.api.models import Candle, Price, StockInfo
+from stock_terminal.api.models import Candle, Price, StockInfo, CloseReference
 
 TOKEN_REFRESH_MARGIN_SECONDS = 60
 MAX_SYMBOLS_PER_CALL = 200
@@ -327,18 +327,28 @@ class TossInvestClient:
         For anything else, falls back to the 1d candle series: the most
         recent candle whose date isn't today.
         """
-        session = _SESSIONS.get(currency or "")
-        if session is not None:
-            return await self._session_close(symbol, session)
+        reference = await self.get_close_reference(symbol, currency)
+        return reference.value if reference else None
 
-        candles = await self.get_candles(symbol, interval="1d", count=2)
-        if not candles:
-            return None
+    @_api_errors
+    async def get_close_reference(
+        self, symbol: str, currency: str | None = None, *, is_index: bool = False
+    ) -> CloseReference | None:
+        session = _KRX_SESSION if is_index else _SESSIONS.get(currency or "")
+        if session is not None:
+            return await self._session_reference(
+                symbol, session,
+                candle_fetcher=self.get_market_indicator_candles if is_index else None,
+            )
+        candles = await self.get_candles(symbol, interval="1d", count=5)
         today = datetime.now(timezone.utc).astimezone().date()
-        for candle in sorted(candles, key=lambda c: c.timestamp, reverse=True):
-            if candle.timestamp.date() != today:
-                return candle.close
-        return candles[0].close
+        candidates = [c for c in candles if c.timestamp.tzinfo is not None
+                      and c.timestamp.astimezone().date() < today
+                      and c.close.is_finite() and c.close > 0]
+        if not candidates:
+            return None
+        candle = max(candidates, key=lambda c: c.timestamp)
+        return CloseReference(candle.close, candle.timestamp.astimezone().date().isoformat(), "daily_fallback")
 
     async def _session_close(
         self,
@@ -347,6 +357,12 @@ class TossInvestClient:
         *,
         candle_fetcher=None,
     ) -> Decimal | None:
+        reference = await self._session_reference(symbol, session, candle_fetcher=candle_fetcher)
+        return reference.value if reference else None
+
+    async def _session_reference(
+        self, symbol: str, session: _MarketSession, *, candle_fetcher=None,
+    ) -> CloseReference | None:
         get_candles = candle_fetcher or self.get_candles
         reference_date = _reference_session_date(session)
 
@@ -354,6 +370,8 @@ class TossInvestClient:
         # (skips weekends/holidays, and any stray candle the feed dates
         # *after* today - e.g. USD after-hours bucketed as tomorrow).
         candles = await get_candles(symbol, interval="1d", count=5)
+        candles = [c for c in candles if c.timestamp.tzinfo is not None
+                   and c.close.is_finite() and c.close > 0]
         trading_day = None
         for candle in sorted(candles, key=lambda c: c.timestamp, reverse=True):
             candle_date = candle.timestamp.astimezone(session.zone).date()
@@ -361,7 +379,7 @@ class TossInvestClient:
                 trading_day = candle_date
                 break
         if trading_day is None:
-            return candles[0].close if candles else None
+            return None
 
         window_end = datetime.combine(
             trading_day, session.auction_end, tzinfo=session.zone
@@ -375,18 +393,23 @@ class TossInvestClient:
         window = [
             c
             for c in minute_candles
-            if session.auction_start
+            if c.timestamp.tzinfo is not None
+            and c.timestamp.astimezone(session.zone).date() == trading_day
+            and c.close.is_finite() and c.close > 0
+            and c.volume.is_finite() and c.volume > 0
+            and session.auction_start
             <= c.timestamp.astimezone(session.zone).time()
             <= session.auction_end
         ]
         if window:
-            return max(window, key=lambda c: c.volume).close
+            candidate = max(window, key=lambda c: (c.volume, c.timestamp))
+            return CloseReference(candidate.close, trading_day.isoformat(), "minute_estimate")
 
         # No 1m data for the auction window (e.g. a thin symbol) - fall
         # back to that day's 1d candle close.
         for candle in candles:
             if candle.timestamp.astimezone(session.zone).date() == trading_day:
-                return candle.close
+                return CloseReference(candle.close, trading_day.isoformat(), "daily_fallback")
         return None
 
 

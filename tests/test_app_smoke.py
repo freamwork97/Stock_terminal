@@ -126,3 +126,42 @@ async def test_partial_market_failure_and_missing_response(fake_settings, tmp_pa
             assert str(table.get_cell("AAPL", "status")) == "정상"
     finally:
         await app.client.aclose()
+
+
+@pytest.mark.parametrize("first", ["none", "error", "fallback"])
+async def test_baseline_retries_without_marking_failure_complete(fake_settings, tmp_path, monkeypatch, first):
+    from unittest.mock import AsyncMock
+    from decimal import Decimal
+    from stock_terminal.api.models import CloseReference
+    from stock_terminal.api.exceptions import TossAPIError
+    from stock_terminal.api.client import trading_day_key
+    from stock_terminal.storage.watchlist import WatchlistItem
+
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", tmp_path / "watchlist.json")
+    clock = [100.0]
+    monkeypatch.setattr("stock_terminal.tui.app.time.monotonic", lambda: clock[0])
+    app = StockTerminalApp(fake_settings)
+    app.watchlist.add(WatchlistItem("AAPL", currency="USD", prev_close=Decimal("90"),
+        prev_close_date="2000-01-01"))
+    initial = {"none": None, "error": TossAPIError("offline"),
+        "fallback": CloseReference(Decimal("100"), "2026-10-23", "daily_fallback")}[first]
+    fetch = AsyncMock(side_effect=[initial, CloseReference(Decimal("101"), "2026-10-23", "minute_estimate")])
+    monkeypatch.setattr(app.client, "get_close_reference", fetch)
+    try:
+        await app._refresh_stale_prev_closes(["AAPL"])
+        if first != "fallback":
+            assert app.watchlist.items["AAPL"].prev_close_date == "2000-01-01"
+            assert app.watchlist.items["AAPL"].prev_close == Decimal("90")
+        await app._refresh_stale_prev_closes(["AAPL"])
+        assert fetch.await_count == 1
+        clock[0] += 61
+        await app._refresh_stale_prev_closes(["AAPL"])
+        assert fetch.await_count == 2
+        item = app.watchlist.items["AAPL"]
+        assert item.prev_close == Decimal("101")
+        assert item.prev_close_date == trading_day_key("USD")
+        assert item.prev_close_source == "minute_estimate"
+        await app._refresh_stale_prev_closes(["AAPL"])
+        assert fetch.await_count == 2
+    finally:
+        await app.client.aclose()

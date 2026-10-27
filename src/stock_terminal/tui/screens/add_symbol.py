@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
+from stock_terminal.api.models import CloseReference
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -20,9 +22,10 @@ _INDEX_ALIASES = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}
 class AddSymbolResult:
     symbol: str
     name: str
-    prev_close: object  # Decimal | None, kept loosely typed to avoid import cycle
+    prev_close: Decimal | None
     currency: str
     is_index: bool = False
+    reference: CloseReference | None = None
 
 
 class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
@@ -98,11 +101,12 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
                     status.update(f"'{symbol}' 지수를 찾을 수 없습니다.")
                     return
                 name = INDEX_CATALOG[symbol]
-                prev_close = await self._client.get_index_previous_close(symbol)
+                reference = await self._client.get_close_reference(symbol, "KRW", is_index=True)
                 self._verified = AddSymbolResult(
                     symbol=symbol,
                     name=name,
-                    prev_close=prev_close,
+                    prev_close=reference.value if reference else None,
+                    reference=reference,
                     currency="PT",
                     is_index=True,
                 )
@@ -115,11 +119,12 @@ class AddSymbolScreen(ModalScreen[AddSymbolResult | None]):
                 status.update(f"'{symbol}' 종목을 찾을 수 없습니다.")
                 return
             info = stocks[0]
-            prev_close = await self._client.get_previous_close(symbol, info.currency)
+            reference = await self._client.get_close_reference(symbol, info.currency)
             self._verified = AddSymbolResult(
                 symbol=info.symbol,
                 name=info.name,
-                prev_close=prev_close,
+                prev_close=reference.value if reference else None,
+                reference=reference,
                 currency=info.currency,
             )
             status.update(f"확인됨: {info.name} ({info.market})")

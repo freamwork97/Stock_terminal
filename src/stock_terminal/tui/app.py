@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -50,6 +51,7 @@ class StockTerminalApp(App):
         ensure_data_dir()
         self.watchlist = Watchlist.load(WATCHLIST_PATH)
         self._view_mode = "both"
+        self._baseline_retry: dict[str, tuple[str, float]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -105,62 +107,45 @@ class StockTerminalApp(App):
         self.sub_title = f"시세 오류: {'; '.join(errors)}" if errors else ""
 
     async def _refresh_stale_prev_closes(self, symbols: list[str]) -> None:
-        """Re-fetch prev_close for items whose baseline predates today.
+        """Refresh each market's baseline without completing failed lookups.
 
-        prev_close is a snapshot taken when a symbol was added (or last
-        refreshed); without this, change %/amount would keep comparing the
-        live price against a stale, ever-older baseline instead of resetting
-        to yesterday's close each trading day. Staleness is judged per-market
-        (see client.trading_day_key) since the correct baseline flips twice
-        a day, not once: at the regular-session close (yesterday's close ->
-        today's own close, for after-hours) and again at midnight (today's
-        close -> tomorrow's pre-market baseline). Missing the close-time
-        flip is what left after-hours prices comparing against a stale,
-        already-superseded baseline for the rest of the session.
-
-        One symbol's fetch failing (API error, unexpected candle data, ...)
-        must never abort this loop: it runs inside the same exclusive worker
-        as the live price poll, so an uncaught exception here doesn't just
-        skip that symbol - it kills the worker outright and every symbol's
-        price/change freezes at its last value until the app is restarted.
-        Catch broadly per-symbol rather than trusting only TossAPIError.
+        Minute estimates are cached for the reference key; daily fallbacks,
+        empty responses and API failures are retried at most once a minute.
+        The actual candle session date is stored separately from that key.
         """
         for symbol in symbols:
-            item = self.watchlist.items[symbol]
-
-            if item.is_index:
-                # KOSPI/KOSDAQ both run on the KRX session, same calendar
-                # as KRW stocks - see client.INDEX_CATALOG.
-                today = _trading_day_key("KRW")
-                if item.prev_close_date == today:
-                    continue
-                try:
-                    prev_close = await self.client.get_index_previous_close(symbol)
-                except Exception:
-                    continue
-                self.watchlist.set_prev_close(symbol, prev_close, today)
+            item = self.watchlist.items.get(symbol)
+            if item is None:
                 continue
-
-            if not item.currency:
-                # Legacy items saved before currency was tracked.
+            if not item.currency and not item.is_index:
                 try:
                     stocks = await self.client.get_stocks([symbol])
-                except Exception:
-                    stocks = []
-                if stocks:
-                    item.currency = stocks[0].currency
-                    self.watchlist.set_currency(symbol, item.currency)
-
-            today = _trading_day_key(item.currency)
-            if item.prev_close_date == today:
+                    if stocks:
+                        self.watchlist.set_currency(symbol, stocks[0].currency)
+                except TossAPIError:
+                    continue
+            today = _trading_day_key("KRW" if item.is_index else item.currency)
+            if (item.prev_close_date == today and item.prev_close is not None
+                    and item.prev_close.is_finite() and item.prev_close > 0
+                    and item.prev_close_session is not None
+                    and item.prev_close_source == "minute_estimate"):
                 continue
+            retry_key, retry_at = self._baseline_retry.get(symbol, ("", 0.0))
+            if retry_key == today and time.monotonic() < retry_at:
+                continue
+            self._baseline_retry[symbol] = (today, time.monotonic() + 60.0)
             try:
-                prev_close = await self.client.get_previous_close(
-                    symbol, item.currency
+                reference = await self.client.get_close_reference(
+                    symbol, item.currency, is_index=item.is_index
                 )
-            except Exception:
+            except TossAPIError:
                 continue
-            self.watchlist.set_prev_close(symbol, prev_close, today)
+            if reference is not None:
+                self.watchlist.set_prev_close(
+                    symbol, reference.value, today,
+                    session_date=reference.session_date, source=reference.source,
+                    confirmed=reference.confirmed,
+                )
 
     @work(exclusive=True, group="chart-poll")
     async def poll_chart(self) -> None:
@@ -204,9 +189,12 @@ class StockTerminalApp(App):
             symbol=result.symbol,
             name=result.name,
             prev_close=result.prev_close,
-            prev_close_date=_trading_day_key(
+            prev_close_date=(_trading_day_key(
                 "KRW" if result.is_index else result.currency
-            ),
+            ) if result.reference else None),
+            prev_close_session=result.reference.session_date if result.reference else None,
+            prev_close_source=result.reference.source if result.reference else "unknown",
+            prev_close_confirmed=result.reference.confirmed if result.reference else False,
             currency=result.currency,
             is_index=result.is_index,
         )

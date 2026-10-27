@@ -10,6 +10,7 @@ from rich.text import Text
 from textual.widgets import DataTable
 
 from stock_terminal.api.models import Price
+from stock_terminal.api.client import trading_day_key
 from stock_terminal.storage.watchlist import Watchlist
 
 COL_SYMBOL = "symbol"
@@ -20,6 +21,7 @@ COL_CHANGE_PCT = "change_pct"
 COL_UPDATED = "updated"
 COL_RECEIVED = "received"
 COL_STATUS = "status"
+COL_BASELINE = "baseline"
 
 UP_STYLE = "bold green"
 DOWN_STYLE = "bold red"
@@ -81,6 +83,7 @@ class WatchlistTable(DataTable):
         self.add_column("현재가", key=COL_PRICE, width=14)
         self.add_column("등락", key=COL_CHANGE, width=12)
         self.add_column("등락률", key=COL_CHANGE_PCT, width=10)
+        self.add_column("기준 종가", key=COL_BASELINE, width=32)
         self.add_column("체결시각 (로컬)", key=COL_UPDATED, width=19)
         self.add_column("수신시각 (로컬)", key=COL_RECEIVED, width=19)
         self.set_interval(1.0, self.refresh_freshness)
@@ -106,6 +109,7 @@ class WatchlistTable(DataTable):
                     item.symbol,
                     "대기",
                     item.name or item.symbol,
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -140,7 +144,19 @@ class WatchlistTable(DataTable):
             change_text = "-"
             change_pct_text = "-"
 
-            if prev_close is not None and prev_close != 0:
+            current_key = trading_day_key("KRW" if item.is_index else item.currency)
+            usable = (prev_close is not None and prev_close.is_finite() and prev_close > 0
+                      and item.prev_close_date == current_key
+                      and item.prev_close_source != "unknown")
+            if not usable:
+                baseline_label = "기준가 재조회 중"
+            else:
+                source_label = {"minute_estimate": "분봉 추정", "daily_fallback": "일봉 대체"}.get(item.prev_close_source, "출처 불명")
+                certainty = "확정" if item.prev_close_confirmed else "미확정"
+                baseline_label = f"{item.prev_close_session or '?'} {source_label} ({certainty})"
+            self.update_cell(symbol, COL_BASELINE, baseline_label)
+
+            if usable:
                 change = price.last_price - prev_close
                 change_pct = (change / prev_close) * Decimal(100)
                 style = UP_STYLE if change > 0 else DOWN_STYLE if change < 0 else FLAT_STYLE

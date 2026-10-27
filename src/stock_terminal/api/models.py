@@ -85,3 +85,11 @@ class Candle:
             close=Decimal(str(data["closePrice"])),
             volume=Decimal(str(data.get("volume", "0"))),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CloseReference:
+    value: Decimal
+    session_date: str
+    source: str
+    confirmed: bool = False  # Candle-derived prices are estimates, not official closes.

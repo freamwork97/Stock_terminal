@@ -19,6 +19,10 @@ class WatchlistItem:
     currency: str = ""  # market's trading-day calendar depends on this
     is_index: bool = False  # routes polling to /api/v1/market-indicators/* instead
 
+    prev_close_session: str | None = None
+    prev_close_source: str = "unknown"
+    prev_close_confirmed: bool = False
+
     def to_dict(self) -> dict:
         d = asdict(self)
         for key in ("alert_upper", "alert_lower", "prev_close"):
@@ -39,6 +43,9 @@ class WatchlistItem:
             alert_lower=dec("alert_lower"),
             prev_close=dec("prev_close"),
             prev_close_date=data.get("prev_close_date"),
+            prev_close_session=data.get("prev_close_session"),
+            prev_close_source=data.get("prev_close_source", "unknown"),
+            prev_close_confirmed=data.get("prev_close_confirmed", False),
             currency=data.get("currency", ""),
             is_index=data.get("is_index", False),
         )
@@ -96,11 +103,17 @@ class Watchlist:
         self.save()
 
     def set_prev_close(
-        self, symbol: str, prev_close: Decimal | None, prev_close_date: str | None
+        self, symbol: str, prev_close: Decimal | None, prev_close_date: str | None,
+        *, session_date: str | None = None, source: str = "unknown", confirmed: bool = False
     ) -> None:
         item = self.items.get(symbol)
         if item is None:
             return
+        if prev_close is None or not prev_close.is_finite() or prev_close <= 0:
+            return
+        item.prev_close_session = session_date
+        item.prev_close_source = source
+        item.prev_close_confirmed = confirmed
         item.prev_close = prev_close
         item.prev_close_date = prev_close_date
         self.save()

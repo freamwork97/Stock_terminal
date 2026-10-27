@@ -9,6 +9,7 @@ import pytest
 from textual.app import App, ComposeResult
 
 from stock_terminal.api.models import Price
+from stock_terminal.api.client import trading_day_key
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem
 from stock_terminal.tui.widgets.watchlist_table import WatchlistTable
 
@@ -22,12 +23,14 @@ class _HarnessApp(App):
 def watchlist() -> Watchlist:
     wl = Watchlist(path=None)  # type: ignore[arg-type]
     wl.items["005930"] = WatchlistItem(
-        symbol="005930", name="삼성전자", prev_close=Decimal("70000")
+        symbol="005930", name="삼성전자", prev_close=Decimal("70000"), currency="KRW",
+        prev_close_source="minute_estimate", prev_close_date=trading_day_key("KRW")
     )
     wl.items["AAPL"] = WatchlistItem(
         symbol="AAPL",
         name="Apple",
-        prev_close=Decimal("200"),
+        prev_close=Decimal("200"), currency="USD",
+        prev_close_source="minute_estimate", prev_close_date=trading_day_key("USD"),
         alert_upper=Decimal("210"),
     )
     return wl
@@ -138,3 +141,34 @@ async def test_trade_age_is_separate_from_receive_age(watchlist, age, status):
         assert table.get_cell("AAPL", "received") != "-"
         table.refresh_freshness()
         assert str(table.get_cell("AAPL", "status")) == status
+
+
+@pytest.mark.parametrize("reason", ["stale", "unknown", "missing"])
+async def test_untrusted_baseline_does_not_show_change(watchlist, reason):
+    item = watchlist.items["AAPL"]
+    if reason == "stale":
+        item.prev_close_date = "2000-01-01"
+    elif reason == "unknown":
+        item.prev_close_source = "unknown"
+    else:
+        item.prev_close = None
+    app = _HarnessApp()
+    async with app.run_test():
+        table = app.query_one(WatchlistTable)
+        table.sync_rows(watchlist)
+        table.apply_prices({"AAPL": Price("AAPL", Decimal("205"), "USD", datetime.now(timezone.utc))}, watchlist)
+        assert str(table.get_cell("AAPL", "change_pct")) == "-"
+        assert table.get_cell("AAPL", "baseline") == "기준가 재조회 중"
+
+
+async def test_estimated_baseline_label(watchlist):
+    item = watchlist.items["AAPL"]
+    item.prev_close_session = "2026-10-23"
+    item.prev_close_source = "daily_fallback"
+    app = _HarnessApp()
+    async with app.run_test():
+        table = app.query_one(WatchlistTable)
+        table.sync_rows(watchlist)
+        table.apply_prices({"AAPL": Price("AAPL", Decimal("205"), "USD", None)}, watchlist)
+        assert table.get_cell("AAPL", "baseline") == "2026-10-23 일봉 대체 (미확정)"
+        assert str(table.get_cell("AAPL", "change_pct")) == "+2.50%"

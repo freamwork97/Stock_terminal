@@ -221,7 +221,7 @@ async def test_get_previous_close_skips_todays_candle(client: TossInvestClient) 
 
 @respx.mock
 async def test_get_previous_close_krw_uses_krx_closing_auction_not_nxt_afterhours(
-    client: TossInvestClient,
+    client: TossInvestClient, monkeypatch,
 ) -> None:
     """KRW previous close must use the 15:30 KST KRX auction print, not the
     1d candle's close - which keeps drifting through NXT after-hours trading
@@ -230,6 +230,7 @@ async def test_get_previous_close_krw_uses_krx_closing_auction_not_nxt_afterhour
     kst = ZoneInfo("Asia/Seoul")
     today = datetime.now(kst).replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday = today - timedelta(days=1)
+    monkeypatch.setattr("stock_terminal.api.client._reference_session_date", lambda session: yesterday.date())
 
     def candles_side_effect(request: httpx.Request) -> httpx.Response:
         interval = request.url.params.get("interval")
@@ -482,7 +483,7 @@ async def test_get_market_indicator_prices_parses_without_currency_field(
 
 @respx.mock
 async def test_get_index_previous_close_uses_krx_closing_auction(
-    client: TossInvestClient,
+    client: TossInvestClient, monkeypatch,
 ) -> None:
     """KOSPI/KOSDAQ share the KRX session close logic with KRW stocks, just
     against the market-indicators candle endpoint."""
@@ -490,6 +491,7 @@ async def test_get_index_previous_close_uses_krx_closing_auction(
     kst = ZoneInfo("Asia/Seoul")
     today = datetime.now(kst).replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday = today - timedelta(days=1)
+    monkeypatch.setattr("stock_terminal.api.client._reference_session_date", lambda session: yesterday.date())
 
     def candles_side_effect(request: httpx.Request) -> httpx.Response:
         interval = request.url.params.get("interval")
@@ -679,3 +681,45 @@ async def test_other_endpoints_normalize_malformed_responses(client, method, pat
     argument = "KOSPI" if "candles" in method else ["KOSPI"]
     with pytest.raises(TossAPIError):
         await getattr(client, method)(argument)
+
+
+@pytest.mark.parametrize("currency", ["KRW", "USD"])
+@pytest.mark.parametrize("kind", ["valid", "wrong_day", "zero_volume", "bad_price", "minute_error", "future_only"])
+async def test_reference_validates_day_and_tracks_provenance(client, monkeypatch, currency, kind):
+    from datetime import date
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+    from stock_terminal.api.client import _SESSIONS
+    from stock_terminal.api.models import Candle
+    from stock_terminal.api.exceptions import TossAPIError
+
+    session = _SESSIONS[currency]
+    day = date(2026, 10, 23)  # Friday, also exercises a weekend/holiday lookback.
+    monkeypatch.setattr("stock_terminal.api.client._reference_session_date", lambda _: date(2026, 10, 25))
+    def candle(stamp, close="100", volume="10"):
+        value = Decimal(close)
+        return Candle(stamp, value, value, value, value, Decimal(volume))
+    daily = candle(datetime.combine(day, dt_time(0), tzinfo=session.zone))
+    minute = candle(datetime.combine(day, session.close, tzinfo=session.zone), "101")
+    wrong_day = candle(minute.timestamp - timedelta(days=1), "999", "99999")
+    if kind == "wrong_day":
+        minutes = [wrong_day]
+    elif kind == "zero_volume":
+        minutes = [candle(minute.timestamp, "101", "0")]
+    elif kind == "bad_price":
+        minutes = [candle(minute.timestamp, "NaN")]
+    else:
+        minutes = [wrong_day, minute]
+    if kind == "future_only":
+        daily = candle(datetime.combine(date(2026, 10, 26), dt_time(0), tzinfo=session.zone))
+    fetch = AsyncMock(side_effect=[[daily], TossAPIError("offline") if kind == "minute_error" else minutes])
+    monkeypatch.setattr(client, "get_candles", fetch)
+    reference = await client.get_close_reference("TEST", currency)
+    if kind == "future_only":
+        assert reference is None
+        assert fetch.await_count == 1
+    else:
+        assert reference.session_date == day.isoformat()
+        assert reference.confirmed is False
+        assert reference.source == ("minute_estimate" if kind == "valid" else "daily_fallback")
+        assert reference.value == Decimal("101" if kind == "valid" else "100")
