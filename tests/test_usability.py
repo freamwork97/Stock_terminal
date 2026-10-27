@@ -351,3 +351,36 @@ async def test_command_menu_empty_result_and_f1_close(app):
         assert isinstance(app.screen, ShortcutsScreen)
         await pilot.press("f1")
         assert not isinstance(app.screen, ShortcutsScreen)
+
+
+async def test_status_is_hidden_and_available_from_command_menu(app):
+    from textual.widgets import Static
+    from stock_terminal.tui.screens.monitoring_status import MonitoringStatusScreen
+    async with app.run_test() as pilot:
+        assert not app.query_one("#summary", Static).display
+        assert not app.query_one("#poll-status", Static).display
+        await pilot.press("f1")
+        app.screen.query_one(Input).value = "모니터링"
+        await pilot.pause()
+        await pilot.press("enter", "enter")
+        assert isinstance(app.screen, MonitoringStatusScreen)
+        details = str(app.screen.query_one("#monitoring-details", Static).render())
+        assert "관심종목" in details
+        assert "주기" in details
+        assert "마지막 수신" in details
+        assert "알림 소리" in details
+        app.action_toggle_sound()
+        app.screen._update_status()
+        assert "알림 소리 꺼짐" in str(app.screen.query_one("#monitoring-details", Static).render())
+        await pilot.press("escape")
+        assert not isinstance(app.screen, MonitoringStatusScreen)
+        assert not app.query_one("#poll-status", Static).display
+
+
+async def test_search_feedback_is_visible_only_while_searching(app):
+    from textual.widgets import Static
+    async with app.run_test() as pilot:
+        await pilot.press("slash")
+        assert app.query_one("#summary", Static).display
+        await pilot.press("escape")
+        assert not app.query_one("#summary", Static).display

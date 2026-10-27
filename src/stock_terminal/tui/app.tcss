@@ -14,3 +14,6 @@ ChartPanel { width: 2fr; height: 1fr; border: round $accent; }
 
 #poll-status { height: auto; padding: 0 1; color: $text-muted; }
 #poll-status.warning { color: $warning; }
+
+#summary, #poll-status { display: none; }
+#summary.visible { display: block; }

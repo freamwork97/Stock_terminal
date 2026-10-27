@@ -20,6 +20,7 @@ from stock_terminal.storage.preferences import Preferences, PreferencesError
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem, WatchlistError
 from stock_terminal.tui.screens.add_symbol import AddSymbolResult
 from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
+from stock_terminal.tui.screens.monitoring_status import MonitoringStatusScreen
 from stock_terminal.tui.screens.shortcuts import ShortcutsScreen
 from stock_terminal.tui.screens.set_alert import AlertResult, SetAlertScreen
 from stock_terminal.tui.widgets.chart_panel import ChartPanel
@@ -37,6 +38,7 @@ class StockTerminalApp(App):
         ("u", "undo_delete", "삭제취소"),
         ("t", "set_alert", "알림설정"),
         ("h", "alert_history", "알림이력"),
+        ("o", "show_status", "모니터링 상태 (관심종목·시세·수신·알림)"),
         ("b", "toggle_sound", "음소거"),
         ("p", "toggle_symbol_alert", "알림중지/재개"),
         ("m", "toggle_chart_mode", "차트모드"),
@@ -63,6 +65,8 @@ class StockTerminalApp(App):
         super().__init__()
         self.settings = settings
         self._health = HealthReporter()
+        self._monitoring_summary = ""
+        self._monitoring_status = ""
         self._poll_health = PollingHealth()
         ensure_data_dir()
         self.watchlist = Watchlist.load(WATCHLIST_PATH)
@@ -475,6 +479,18 @@ class StockTerminalApp(App):
                 await self.run_action(action)
         self.push_screen(ShortcutsScreen(tuple(entries.values())), execute)
 
+    def action_show_status(self) -> None:
+        self.push_screen(MonitoringStatusScreen(self._monitoring_details))
+
+    def _monitoring_details(self) -> str:
+        self._update_summary()
+        self._update_poll_status()
+        snapshot = self._poll_health.snapshot(self.settings.poll_interval_seconds, bool(self.watchlist.items))
+        paused = sum(not item.alerts_enabled for item in self.watchlist.items.values())
+        return (f"{self._monitoring_summary}\n\n{self._monitoring_status}\n\n"
+                f"알림 중지 종목 {paused}개\n"
+                f"누적 성공 {snapshot['success_count']} · 실패 {snapshot['failure_count']} · 누락 {snapshot['missing_count']}")
+
     def action_alert_history(self) -> None:
         self.push_screen(AlertHistoryScreen(tuple(self.query_one(WatchlistTable).alerts.history)))
 
@@ -489,6 +505,7 @@ class StockTerminalApp(App):
         message = (f"시세 {labels[snapshot['state']]} · 조회 {snapshot['duration_seconds']:.1f}초 "
                    f"/ 주기 {self.settings.poll_interval_seconds:g}초 · 마지막 수신 {received_text} · "
                    f"알림 소리 {'꺼짐' if self._sound_muted else '켜짐'}")
+        self._monitoring_status = message
         status = self.query_one("#poll-status", Static)
         status.update(message)
         status.set_class(snapshot["state"] in ("slow", "stalled", "failed", "no_data"), "warning")
@@ -506,7 +523,10 @@ class StockTerminalApp(App):
             message = "관심종목이 없습니다."
         elif not table.row_count:
             message = "관심목록에 일치하는 종목이 없습니다."
-        self.query_one("#summary", Static).update(self._search_status or message)
+        self._monitoring_summary = message
+        query = self.query_one("#filter", Input).value.strip()
+        feedback = self._search_status or ("검색 결과가 없습니다. 정확한 종목 코드로 조회할 수 있습니다." if query and not table.row_count else "")
+        self.query_one("#summary", Static).update(feedback)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "filter":
@@ -528,6 +548,7 @@ class StockTerminalApp(App):
         search = self.query_one("#filter", Input)
         search.add_class("visible")
         self.query_one("#search-actions").add_class("visible")
+        self.query_one("#summary").add_class("visible")
         search.focus()
 
     def action_clear_filter(self) -> None:
@@ -535,6 +556,7 @@ class StockTerminalApp(App):
         self._invalidate_search()
         search.value = ""
         self.query_one("#search-actions").remove_class("visible")
+        self.query_one("#summary").remove_class("visible")
         search.remove_class("visible")
         self.query_one(WatchlistTable).focus()
 
