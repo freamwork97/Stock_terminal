@@ -367,12 +367,11 @@ class StockTerminalApp(App):
         if not self.query("#summary") or not self.query(WatchlistTable):
             return
         table = self.query_one(WatchlistTable)
-        message = (f"관심종목 {table.row_count}/{len(self.watchlist.items)} · {table.sort_mode} · "
-                   "a 추가 | t 가격알림 | h 이력 | r 새로고침")
+        message = f"관심종목 {table.row_count}/{len(self.watchlist.items)} · {table.sort_mode}"
         if not self.watchlist.items:
-            message = "관심종목이 없습니다 — a 키로 종목을 추가하세요."
+            message = "관심종목이 없습니다."
         elif not table.row_count:
-            message = "관심목록에 없습니다 — 정확한 종목 코드 입력 후 Enter로 조회·추가하세요."
+            message = "관심목록에 일치하는 종목이 없습니다."
         self.query_one("#summary", Static).update(self._search_status or message)
 
     def on_input_changed(self, event: Input.Changed) -> None:
