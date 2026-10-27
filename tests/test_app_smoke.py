@@ -16,6 +16,12 @@ from stock_terminal.tui.widgets.chart_panel import ChartPanel
 from stock_terminal.tui.widgets.watchlist_table import WatchlistTable
 
 
+@pytest.fixture(autouse=True)
+def disable_background_baselines(monkeypatch):
+    # These tests exercise other workers or invoke baseline refresh explicitly.
+    monkeypatch.setattr(StockTerminalApp, "poll_baselines", lambda self: None)
+
+
 @pytest.fixture
 def fake_settings() -> Settings:
     return Settings(

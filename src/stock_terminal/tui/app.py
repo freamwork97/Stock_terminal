@@ -54,6 +54,8 @@ class StockTerminalApp(App):
         self.watchlist = Watchlist.load(WATCHLIST_PATH)
         self._view_mode = "both"
         self._baseline_retry: dict[str, tuple[str, float]] = {}
+        self._baseline_failures: dict[str, int] = {}
+        self._baseline_slots = asyncio.Semaphore(3)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -66,9 +68,13 @@ class StockTerminalApp(App):
         table = self.query_one(WatchlistTable)
         table.sync_rows(self.watchlist)
         self.poll_prices()
+        self.poll_baselines()
         self.poll_chart()
 
     async def on_unmount(self) -> None:
+        workers = list(self.workers)
+        self.workers.cancel_all()
+        await asyncio.gather(*(worker.wait() for worker in workers), return_exceptions=True)
         await self.client.aclose()
 
     # -- polling workers ----------------------------------------------------
@@ -84,7 +90,6 @@ class StockTerminalApp(App):
         symbols = self.watchlist.symbols
         if not symbols:
             return
-        await self._refresh_stale_prev_closes(symbols)
         stock_symbols = [s for s in symbols if not self.watchlist.items[s].is_index]
         index_symbols = [s for s in symbols if self.watchlist.items[s].is_index]
         errors = []
@@ -104,46 +109,77 @@ class StockTerminalApp(App):
                 errors.append(str(exc))
         self.sub_title = f"시세 오류: {'; '.join(errors)}" if errors else ""
 
-    async def _refresh_stale_prev_closes(self, symbols: list[str]) -> None:
-        """Refresh each market's baseline without completing failed lookups.
+    @work(exclusive=True, group="baselines")
+    async def poll_baselines(self) -> None:
+        while True:
+            await self._refresh_stale_prev_closes(self.watchlist.symbols)
+            await asyncio.sleep(1.0)
 
-        Minute estimates are cached for the reference key; daily fallbacks,
-        empty responses and API failures are retried at most once a minute.
-        The actual candle session date is stored separately from that key.
+    async def _refresh_stale_prev_closes(self, symbols: list[str]) -> None:
+        """Run a bounded pool independently of live-price polling.
+
+        TaskGroup ensures queued and active lookups are cancelled together on
+        shutdown. Each lookup rechecks eligibility after acquiring a slot.
         """
-        for symbol in symbols:
-            item = self.watchlist.items.get(symbol)
-            if item is None:
-                continue
-            if not item.currency and not item.is_index:
-                try:
-                    stocks = await self.client.get_stocks([symbol])
-                    if stocks:
-                        self.watchlist.set_currency(symbol, stocks[0].currency)
-                except TossAPIError:
-                    continue
+        pending = iter([(symbol, self.watchlist.items.get(symbol))
+                        for symbol in dict.fromkeys(symbols)])
+
+        async def consume() -> None:
+            for symbol, item in pending:
+                if item is not None:
+                    await self._refresh_baseline(symbol, item)
+
+        async with asyncio.TaskGroup() as tasks:
+            for _ in range(min(3, len(symbols))):
+                tasks.create_task(consume())
+
+    async def _refresh_baseline(self, symbol: str, item: WatchlistItem) -> None:
+        async with self._baseline_slots:
+            if self.watchlist.items.get(symbol) is not item:
+                return
             today = _trading_day_key("KRW" if item.is_index else item.currency)
             if (item.prev_close_date == today and item.prev_close is not None
                     and item.prev_close.is_finite() and item.prev_close > 0
                     and item.prev_close_session is not None
                     and item.prev_close_source == "minute_estimate"):
-                continue
+                return
             retry_key, retry_at = self._baseline_retry.get(symbol, ("", 0.0))
             if retry_key == today and time.monotonic() < retry_at:
-                continue
-            self._baseline_retry[symbol] = (today, time.monotonic() + 60.0)
+                return
+            if retry_key != today:
+                self._baseline_failures.pop(symbol, None)
+            reference = None
             try:
+                if not item.currency and not item.is_index:
+                    stocks = await self.client.get_stocks([symbol])
+                    if self.watchlist.items.get(symbol) is not item:
+                        return
+                    info = next((stock for stock in stocks if stock.symbol == symbol), None)
+                    if info is None or not info.currency:
+                        raise TossAPIError("종목 통화 정보를 찾을 수 없습니다.")
+                    self.watchlist.set_currency(symbol, info.currency)
+                    today = _trading_day_key(item.currency)
                 reference = await self.client.get_close_reference(
                     symbol, item.currency, is_index=item.is_index
                 )
             except TossAPIError:
-                continue
+                pass
+            if self.watchlist.items.get(symbol) is not item:
+                return
             if reference is not None:
                 self.watchlist.set_prev_close(
                     symbol, reference.value, today,
                     session_date=reference.session_date, source=reference.source,
                     confirmed=reference.confirmed,
                 )
+                self._baseline_failures.pop(symbol, None)
+                delay = 60.0  # Retry a daily fallback; minute estimates are cached.
+            else:
+                failures = min(self._baseline_failures.get(symbol, 0) + 1, 5)
+                self._baseline_failures[symbol] = failures
+                delay = min(60.0 * 2 ** (failures - 1), 900.0)
+            # Measure from completion, so slow failures never cause immediate retries.
+            self._baseline_retry[symbol] = (today, time.monotonic() + delay)
 
     @work(exclusive=True, group="chart-poll")
     async def poll_chart(self) -> None:
@@ -196,6 +232,8 @@ class StockTerminalApp(App):
             currency=result.currency,
             is_index=result.is_index,
         )
+        self._baseline_retry.pop(result.symbol, None)
+        self._baseline_failures.pop(result.symbol, None)
         self.watchlist.add(item)
         self.query_one(WatchlistTable).sync_rows(self.watchlist)
         self._refresh_one(result.symbol)
@@ -221,6 +259,8 @@ class StockTerminalApp(App):
         if not symbol:
             return
         self.watchlist.remove(symbol)
+        self._baseline_retry.pop(symbol, None)
+        self._baseline_failures.pop(symbol, None)
         table.sync_rows(self.watchlist)
 
     def action_set_alert(self) -> None:
