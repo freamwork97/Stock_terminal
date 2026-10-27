@@ -225,3 +225,29 @@ async def test_numeric_sort_preserves_selected_symbol(watchlist):
         assert table.get_row_index("AAPL") == 0
         assert table.selected_symbol == selected
         assert "≥$210.00" in table.get_cell("AAPL", "alert")
+
+
+@pytest.mark.parametrize("sort_mode", ["등록순", "심볼순", "등락률순"])
+async def test_refresh_preserves_scroll_and_selected_symbol(sort_mode):
+    watchlist = Watchlist(path=None)
+    for i in range(50):
+        symbol = f"S{i:02}"
+        watchlist.items[symbol] = WatchlistItem(symbol, currency="USD", prev_close=Decimal("100"),
+            prev_close_date=trading_day_key("USD"), prev_close_source="minute_estimate")
+    app = _HarnessApp()
+    async with app.run_test(size=(80, 20)) as pilot:
+        table = app.query_one(WatchlistTable)
+        table.sync_rows(watchlist)
+        table.sort_mode = sort_mode
+        table.sort_rows()
+        await pilot.pause()
+        selected = table.selected_symbol
+        table.scroll_to(x=25, y=25, animate=False, force=True)
+        await pilot.pause()
+        before = (table.scroll_x, table.scroll_y)
+        assert before[1] > 0
+        for value in ("101", "102", "103"):
+            table.apply_prices({"S49": Price("S49", Decimal(value), "USD", None)}, watchlist)
+            await pilot.pause()
+            assert (table.scroll_x, table.scroll_y) == before
+            assert table.selected_symbol == selected

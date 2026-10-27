@@ -73,6 +73,21 @@ class WatchlistTable(DataTable):
         if symbol in self.rows:
             self.update_cell(symbol, column, value)
 
+    def _restore_selection(self, symbol: str) -> None:
+        self._preserve_scroll = True
+        try:
+            self.move_cursor(row=self.get_row_index(symbol), animate=False, scroll=False)
+        finally:
+            self._preserve_scroll = False
+
+    def watch_cursor_coordinate(self, old_coordinate, new_coordinate) -> None:
+        if getattr(self, "_preserve_scroll", False) and self.cursor_type == "row":
+            if old_coordinate != new_coordinate:
+                self.refresh_row(old_coordinate.row)
+                self._highlight_row(new_coordinate.row)
+        else:
+            super().watch_cursor_coordinate(old_coordinate, new_coordinate)
+
     def sort_rows(self) -> None:
         selected = self.selected_symbol
         if self.sort_mode == "등록순":
@@ -86,7 +101,7 @@ class WatchlistTable(DataTable):
                 return Decimal(value) if value != "-" else Decimal("-Infinity")
             self.sort(COL_CHANGE_PCT, key=change, reverse=True)
         if selected in self.rows:
-            self.move_cursor(row=self.get_row_index(selected), animate=False)
+            self._restore_selection(selected)
 
     def refresh_freshness(self) -> None:
         for symbol, received in self._received_at.items():
@@ -157,7 +172,7 @@ class WatchlistTable(DataTable):
                 self._put(symbol, COL_ALERT, cache[COL_ALERT])
         self.sort_rows()
         if selected in self.rows:
-            self.move_cursor(row=self.get_row_index(selected), animate=False)
+            self._restore_selection(selected)
 
     @property
     def selected_symbol(self) -> str | None:
@@ -236,7 +251,8 @@ class WatchlistTable(DataTable):
                 triggered.append(symbol)
                 self.post_message(self.AlertTriggered(event))
 
-        self.sort_rows()
+        if self.sort_mode == "등락률순":
+            self.sort_rows()
         return triggered
 
     def flash(self, symbol: str) -> None:
