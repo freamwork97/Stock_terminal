@@ -125,11 +125,11 @@ class StockTerminalApp(App):
             await asyncio.sleep(self.settings.poll_interval_seconds)
 
     async def _refresh_prices(self, table: WatchlistTable) -> None:
-        symbols = self.watchlist.symbols
-        if not symbols:
+        items = dict(self.watchlist.items)
+        if not items:
             return
-        stock_symbols = [s for s in symbols if not self.watchlist.items[s].is_index]
-        index_symbols = [s for s in symbols if self.watchlist.items[s].is_index]
+        stock_symbols = [s for s, item in items.items() if not item.is_index]
+        index_symbols = [s for s, item in items.items() if item.is_index]
         errors = []
         for requested, fetch in (
             (stock_symbols, self.client.get_prices),
@@ -139,11 +139,12 @@ class StockTerminalApp(App):
                 continue
             try:
                 prices = await fetch(requested)
-                price_map = {p.symbol: p for p in prices if p.symbol in requested}
+                current = {s for s in requested if self.watchlist.items.get(s) is items[s]}
+                price_map = {p.symbol: p for p in prices if p.symbol in current}
                 table.apply_prices(price_map, self.watchlist)
-                table.mark_missing(requested, set(price_map))
+                table.mark_missing(list(current), set(price_map))
             except TossAPIError as exc:
-                table.mark_failed(requested)
+                table.mark_failed([s for s in requested if self.watchlist.items.get(s) is items[s]])
                 errors.append(str(exc))
         table.border_subtitle = f"시세 오류: {'; '.join(errors)}" if errors else ""
         self._update_summary()
@@ -254,11 +255,13 @@ class StockTerminalApp(App):
                 candles = await self.client.get_candles(
                     symbol, interval=interval, count=100
                 )
-            if table.selected_symbol == symbol and chart.interval == interval:
+            if (table.selected_symbol == symbol and chart.interval == interval
+                    and self.watchlist.items.get(symbol) is item):
                 chart.show_candles(symbol, candles)
                 chart.border_subtitle = ""
         except TossAPIError as exc:
-            if table.selected_symbol == symbol and chart.interval == interval:
+            if (table.selected_symbol == symbol and chart.interval == interval
+                    and self.watchlist.items.get(symbol) is item):
                 if not keep_data:
                     chart.clear_chart(f"{symbol} 차트 조회 실패 — r: 재시도")
                 chart.border_subtitle = str(exc)
@@ -304,18 +307,23 @@ class StockTerminalApp(App):
 
     @work(exclusive=False, group="refresh-one")
     async def _refresh_one(self, symbol: str) -> None:
+        table = self.query_one(WatchlistTable)
+        item = self.watchlist.items.get(symbol)
+        if item is None:
+            return
         try:
-            item = self.watchlist.items.get(symbol)
-            if item is not None and item.is_index:
+            if item.is_index:
                 prices = await self.client.get_market_indicator_prices([symbol])
             else:
                 prices = await self.client.get_prices([symbol])
-            table = self.query_one(WatchlistTable)
+            if self.watchlist.items.get(symbol) is not item:
+                return
             price_map = {p.symbol: p for p in prices if p.symbol == symbol}
             table.apply_prices(price_map, self.watchlist)
             table.mark_missing([symbol], set(price_map))
         except TossAPIError:
-            self.query_one(WatchlistTable).mark_failed([symbol])
+            if self.watchlist.items.get(symbol) is item:
+                table.mark_failed([symbol])
 
     def action_delete_symbol(self) -> None:
         table = self.query_one(WatchlistTable)
