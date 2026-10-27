@@ -250,3 +250,71 @@ async def test_keyboard_lookup_failure_retry_and_escape(app, monkeypatch):
         await pilot.press("escape")
         assert not app.query_one("#filter", Input).display
         assert not app.watchlist.items
+
+
+async def test_global_mute_keeps_visual_alerts_and_history(app, monkeypatch):
+    from stock_terminal.api.models import Price
+    from stock_terminal.storage.preferences import Preferences
+    app.watchlist.add(WatchlistItem("AAPL", alert_upper=Decimal("210")))
+    bell = Mock()
+    monkeypatch.setattr(app, "bell", bell)
+    async with app.run_test() as pilot:
+        await pilot.press("b")
+        table = app.query_one(WatchlistTable)
+        table.apply_prices({"AAPL": Price("AAPL", Decimal("215"), "USD", None)}, app.watchlist)
+        await pilot.pause()
+        bell.assert_not_called()
+        assert len(table.alerts.history) == 1
+        assert app._sound_muted
+        assert Preferences.load(app._preferences_path)[0].sound_muted
+        await pilot.press("b")
+        assert not app._sound_muted
+        # Unmuting must not replay an alert for a price still above its threshold.
+        table.apply_prices({"AAPL": Price("AAPL", Decimal("215"), "USD", None)}, app.watchlist)
+        await pilot.pause()
+        bell.assert_not_called()
+
+
+async def test_symbol_pause_keeps_prices_and_thresholds_then_rearms(app, monkeypatch):
+    from stock_terminal.api.models import Price
+    from stock_terminal.storage.watchlist import Watchlist
+    app.watchlist.add(WatchlistItem("AAPL", alert_upper=Decimal("210")))
+    bell = Mock()
+    monkeypatch.setattr(app, "bell", bell)
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        table = app.query_one(WatchlistTable)
+        price = {"AAPL": Price("AAPL", Decimal("215"), "USD", None)}
+        assert not app.watchlist.items["AAPL"].alerts_enabled
+        assert app.watchlist.items["AAPL"].alert_upper == Decimal("210")
+        assert "중지" in table.get_cell("AAPL", "alert")
+        assert not Watchlist.load(app.watchlist.path).items["AAPL"].alerts_enabled
+        table.apply_prices(price, app.watchlist)
+        await pilot.pause()
+        assert "$215.00" in str(table.get_cell("AAPL", "price"))
+        assert not table.alerts.history
+        bell.assert_not_called()
+        await pilot.press("p")
+        table.apply_prices(price, app.watchlist)
+        table.apply_prices(price, app.watchlist)
+        await pilot.pause()
+        assert bell.call_count == 1
+        assert len(table.alerts.history) == 1
+        assert "중지" not in table.get_cell("AAPL", "alert")
+
+
+async def test_alert_control_save_errors_keep_previous_state(app, monkeypatch):
+    from stock_terminal.storage.watchlist import WatchlistError
+    from stock_terminal.storage.preferences import Preferences, PreferencesError
+    app.watchlist.add(WatchlistItem("AAPL", alert_upper=Decimal("210")))
+    async with app.run_test() as pilot:
+        def fail_watchlist(*args):
+            raise WatchlistError("locked")
+        def fail_preferences(*args):
+            raise PreferencesError("locked")
+        monkeypatch.setattr(app.watchlist.__class__, "save", fail_watchlist)
+        monkeypatch.setattr(Preferences, "save", fail_preferences)
+        await pilot.press("b", "p")
+        assert not app._sound_muted
+        assert app.watchlist.items["AAPL"].alerts_enabled
+        assert app.watchlist.items["AAPL"].alert_upper == Decimal("210")

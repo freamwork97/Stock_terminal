@@ -62,3 +62,13 @@ async def test_display_preferences_are_restored_after_restart(tmp_path, monkeypa
             await second.client.aclose()
     finally:
         await first.client.aclose()
+
+
+def test_sound_mute_roundtrip_and_strict_boolean(tmp_path):
+    path = tmp_path / "preferences.json"
+    Preferences(sound_muted=True).save(path)
+    assert Preferences.load(path)[0].sound_muted is True
+    path.write_text('{"sound_muted": 1}', encoding="utf-8")
+    preferences, notice = Preferences.load(path)
+    assert preferences.sound_muted is False
+    assert notice

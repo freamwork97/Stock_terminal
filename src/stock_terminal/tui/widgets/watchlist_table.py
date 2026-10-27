@@ -164,6 +164,8 @@ class WatchlistTable(DataTable):
                 label + _format_amount(value, "PT" if item.is_index else item.currency)
                 for label, value in (("≥", item.alert_upper), ("≤", item.alert_lower)) if value is not None
             ) or "없음"
+            if not item.alerts_enabled:
+                cache[COL_ALERT] = "중지 · " + cache[COL_ALERT]
             if symbol in wanted:
                 if symbol not in self.rows:
                     defaults = {COL_SYMBOL: symbol, COL_STATUS: "대기", COL_NAME: item.name or symbol}
@@ -246,7 +248,7 @@ class WatchlistTable(DataTable):
             self._put(symbol, COL_UPDATED, updated_text)
 
             event = self.alerts.evaluate(symbol, price.last_price, price.currency,
-                                         item.alert_upper, item.alert_lower)
+                                         item.alert_upper, item.alert_lower, enabled=item.alerts_enabled)
             if event is not None:
                 triggered.append(symbol)
                 self.post_message(self.AlertTriggered(event))

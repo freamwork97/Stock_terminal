@@ -36,6 +36,8 @@ class StockTerminalApp(App):
         ("u", "undo_delete", "삭제취소"),
         ("t", "set_alert", "알림설정"),
         ("h", "alert_history", "알림이력"),
+        ("b", "toggle_sound", "음소거"),
+        ("p", "toggle_symbol_alert", "알림중지/재개"),
         ("m", "toggle_chart_mode", "차트모드"),
         ("i", "toggle_interval", "봉주기"),
         ("v", "cycle_view", "화면전환"),
@@ -67,6 +69,7 @@ class StockTerminalApp(App):
         self._preferences_path = WATCHLIST_PATH.with_name("preferences.json")
         self._preferences, self._preferences_notice = Preferences.load(self._preferences_path)
         self._view_mode = self._preferences.view_mode
+        self._sound_muted = self._preferences.sound_muted
         self._deleted_item: WatchlistItem | None = None
         self._search_result: AddSymbolResult | None = None
         self._search_worker = None
@@ -424,10 +427,32 @@ class StockTerminalApp(App):
 
     def on_watchlist_table_alert_triggered(self, message: WatchlistTable.AlertTriggered) -> None:
         event = message.event
+        item = self.watchlist.items.get(event.symbol)
+        if item is None or not item.alerts_enabled:
+            return
         self.query_one(WatchlistTable).flash(event.symbol)
-        self.bell()
+        if not self._sound_muted:
+            self.bell()
         direction = "상한 이상" if event.direction == "upper" else "하한 이하"
         self.notify(f"{event.symbol}: {direction} ({event.price} / 기준 {event.threshold})", title="가격 알림")
+
+    def action_toggle_sound(self) -> None:
+        previous = self._sound_muted
+        self._sound_muted = not previous
+        if not self._save_preferences():
+            self._sound_muted = previous
+        self._update_poll_status()
+
+    def action_toggle_symbol_alert(self) -> None:
+        table = self.query_one(WatchlistTable)
+        symbol = table.selected_symbol
+        if symbol is None:
+            return
+        item = self.watchlist.items[symbol]
+        if self._persist(self.watchlist.set_alerts_enabled, symbol, not item.alerts_enabled):
+            table.alerts.reset(symbol)
+            table.sync_rows(self.watchlist)
+            self.notify(f"{symbol} 알림 {'재개' if item.alerts_enabled else '중지'}", timeout=2)
 
     def action_alert_history(self) -> None:
         self.push_screen(AlertHistoryScreen(tuple(self.query_one(WatchlistTable).alerts.history)))
@@ -441,7 +466,8 @@ class StockTerminalApp(App):
         received = self._poll_health.last_received
         received_text = received.astimezone().strftime("%m-%d %H:%M:%S") if received else "없음"
         message = (f"시세 {labels[snapshot['state']]} · 조회 {snapshot['duration_seconds']:.1f}초 "
-                   f"/ 주기 {self.settings.poll_interval_seconds:g}초 · 마지막 수신 {received_text}")
+                   f"/ 주기 {self.settings.poll_interval_seconds:g}초 · 마지막 수신 {received_text} · "
+                   f"알림 소리 {'꺼짐' if self._sound_muted else '켜짐'}")
         status = self.query_one("#poll-status", Static)
         status.update(message)
         status.set_class(snapshot["state"] in ("slow", "stalled", "failed", "no_data"), "warning")
@@ -567,16 +593,18 @@ class StockTerminalApp(App):
         self._update_summary()
         self._save_preferences()
 
-    def _save_preferences(self) -> None:
+    def _save_preferences(self) -> bool:
         chart = self.query_one(ChartPanel)
         preferences = Preferences(self._view_mode, self.query_one(WatchlistTable).sort_mode,
-                                  chart.mode, chart.interval)
+                                  chart.mode, chart.interval, self._sound_muted)
         try:
             preferences.save(self._preferences_path)
             self._preferences = preferences
+            return True
         except PreferencesError as exc:
             record("operation_failed", "preferences", error=exc)
             self.notify(str(exc), title="화면 설정", severity="error", timeout=10)
+            return False
 
     def action_refresh_now(self) -> None:
         self.poll_prices()

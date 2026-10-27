@@ -258,3 +258,15 @@ def test_duplicate_symbols_are_rejected_without_silent_data_loss(tmp_path):
     with pytest.raises(WatchlistError):
         Watchlist.load(path)
     assert path.read_bytes() == content
+
+
+def test_alert_pause_legacy_defaults_and_roundtrip(tmp_path):
+    assert WatchlistItem.from_dict({"symbol": "AAPL"}).alerts_enabled is True
+    watchlist = Watchlist(tmp_path / "watchlist.json")
+    watchlist.add(WatchlistItem("AAPL", alert_upper=Decimal("210")))
+    watchlist.set_alerts_enabled("AAPL", False)
+    item = Watchlist.load(watchlist.path).items["AAPL"]
+    assert item.alerts_enabled is False
+    assert item.alert_upper == Decimal("210")
+    with pytest.raises(ValueError):
+        WatchlistItem.from_dict({"symbol": "AAPL", "alerts_enabled": "false"})

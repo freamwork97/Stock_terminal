@@ -16,6 +16,7 @@ class Preferences:
     sort_mode: str = "등록순"
     chart_mode: str = "candle"
     chart_interval: str = "1d"
+    sound_muted: bool = False
 
     @classmethod
     def load(cls, path: Path) -> tuple["Preferences", str | None]:
@@ -38,6 +39,11 @@ class Preferences:
                 setattr(defaults, key, value)
             else:
                 invalid.append(key)
+        muted = raw.get("sound_muted", False)
+        if type(muted) is bool:
+            defaults.sound_muted = muted
+        else:
+            invalid.append("sound_muted")
         return defaults, ("화면 설정의 잘못된 값을 기본값으로 대체했습니다: " + ", ".join(invalid)) if invalid else None
 
     def save(self, path: Path) -> None:

@@ -36,7 +36,10 @@ class AlertTracker:
         self._states.pop(symbol, None)
 
     def evaluate(self, symbol: str, price: Decimal, currency: str,
-                 upper: Decimal | None, lower: Decimal | None) -> AlertEvent | None:
+                 upper: Decimal | None, lower: Decimal | None, *, enabled: bool = True) -> AlertEvent | None:
+        if not enabled:
+            self.reset(symbol)
+            return None
         if not price.is_finite() or price <= 0:
             return None
         thresholds = (upper, lower)

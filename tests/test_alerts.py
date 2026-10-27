@@ -82,3 +82,15 @@ def test_invalid_inputs_do_not_fire_or_mutate_state(clock, value):
     assert evaluate(tracker, "110", upper="90", lower="110") is None
     assert not tracker.history
     assert evaluate(tracker, "110") is not None
+
+
+def test_disabled_symbol_does_not_create_history_or_consume_cooldown(clock):
+    tracker = AlertTracker()
+    args = ("AAPL", Decimal("110"), "USD", Decimal("110"), None)
+    assert tracker.evaluate(*args, enabled=False) is None
+    assert not tracker.history
+    assert not tracker._states
+    assert tracker.evaluate(*args, enabled=True) is not None
+    assert tracker.evaluate(*args, enabled=True) is None
+    assert tracker.evaluate(*args, enabled=False) is None
+    assert tracker.evaluate(*args, enabled=True) is not None

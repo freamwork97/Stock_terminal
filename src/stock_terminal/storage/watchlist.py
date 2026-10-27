@@ -54,6 +54,7 @@ class WatchlistItem:
     name: str = ""
     alert_upper: Decimal | None = None
     alert_lower: Decimal | None = None
+    alerts_enabled: bool = True
     prev_close: Decimal | None = None
     prev_close_date: str | None = None  # ISO date the prev_close was fetched for
     currency: str = ""  # market's trading-day calendar depends on this
@@ -77,7 +78,7 @@ class WatchlistItem:
         for key in ("name", "currency", "prev_close_source"):
             if key in data and not isinstance(data[key], str):
                 raise ValueError(f"{key} 형식 오류")
-        for key in ("is_index", "prev_close_confirmed"):
+        for key in ("is_index", "prev_close_confirmed", "alerts_enabled"):
             if key in data and not isinstance(data[key], bool):
                 raise ValueError(f"{key} 형식 오류")
         for key in ("prev_close_date", "prev_close_session"):
@@ -106,6 +107,7 @@ class WatchlistItem:
             name=data.get("name", ""),
             alert_upper=dec("alert_upper"),
             alert_lower=dec("alert_lower"),
+            alerts_enabled=data.get("alerts_enabled", True),
             prev_close=dec("prev_close"),
             prev_close_date=data.get("prev_close_date"),
             prev_close_session=data.get("prev_close_session"),
@@ -228,6 +230,14 @@ class Watchlist:
             return
         item.alert_upper = upper
         item.alert_lower = lower
+        self.save()
+
+    @_transaction
+    def set_alerts_enabled(self, symbol: str, enabled: bool) -> None:
+        item = self.items.get(symbol)
+        if item is None:
+            return
+        item.alerts_enabled = enabled
         self.save()
 
     @_transaction
