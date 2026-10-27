@@ -39,6 +39,7 @@ class StockTerminalApp(App):
         ("r", "refresh_now", "새로고침"),
         ("s", "sort_watchlist", "정렬"),
         ("slash", "focus_filter", "검색"),
+        ("ctrl+enter", "lookup_from_search", "종목조회"),
         ("escape", "clear_filter", "검색해제"),
         ("q", "quit", "종료"),
     ]
@@ -408,7 +409,7 @@ class StockTerminalApp(App):
             if self.query_one(WatchlistTable).row_count:
                 self.query_one(WatchlistTable).focus()
             else:
-                self._search_worker = self.lookup_search()
+                self.action_lookup_from_search()
 
     def action_focus_filter(self) -> None:
         search = self.query_one("#filter", Input)
@@ -459,15 +460,18 @@ class StockTerminalApp(App):
                 else:
                     self._search_result = AddSymbolResult(info.symbol, info.name, None, info.currency)
             if self._search_result is not None:
-                self._search_status = f"확인됨: {self._search_result.name} ({symbol}) — 관심목록에 추가 버튼을 누르세요."
-                self.query_one("#search-add", Button).disabled = False
+                self._search_status = f"확인됨: {self._search_result.name} ({symbol}) — Enter로 관심목록에 추가합니다."
+                add_button = self.query_one("#search-add", Button)
+                add_button.disabled = False
+                if self.query_one("#filter", Input).has_focus or self.query_one("#search-lookup", Button).has_focus:
+                    add_button.focus()
         except TossAPIError as exc:
             self._search_status = f"조회 실패: {exc} — Enter로 다시 시도하세요."
         self._update_summary()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "search-lookup":
-            self._search_worker = self.lookup_search()
+            self.action_lookup_from_search()
         elif event.button.id == "search-add" and self._search_result is not None:
             result = self._search_result
             self._on_symbol_added(result)
@@ -475,6 +479,17 @@ class StockTerminalApp(App):
                 self.action_clear_filter()
                 table = self.query_one(WatchlistTable)
                 table.move_cursor(row=table.get_row_index(result.symbol), animate=False)
+
+    def action_lookup_from_search(self) -> None:
+        search = self.query_one("#filter", Input)
+        if not search.display:
+            self.action_focus_filter()
+            return
+        if not search.value.strip():
+            search.focus()
+            return
+        if self._search_worker is None or not self._search_worker.is_running:
+            self._search_worker = self.lookup_search()
 
     def action_sort_watchlist(self) -> None:
         table = self.query_one(WatchlistTable)

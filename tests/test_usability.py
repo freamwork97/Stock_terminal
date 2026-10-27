@@ -207,3 +207,46 @@ async def test_chart_refresh_retains_data_during_wait_and_failure(app, monkeypat
         await worker.wait()
         assert chart._candles == candles
         assert str(chart.border_subtitle) == "offline"
+
+
+async def test_keyboard_only_lookup_confirm_add(app, monkeypatch):
+    monkeypatch.setattr(app.client, "get_stocks", AsyncMock(return_value=[StockInfo("MSFT", "Microsoft", "Microsoft", "US", "USD", "stock")]))
+    monkeypatch.setattr(app.client, "get_prices", AsyncMock(return_value=[]))
+    async with app.run_test() as pilot:
+        await pilot.press("slash", "m", "s", "f", "t", "enter")
+        await pilot.pause()
+        assert app.query_one("#search-add", Button).has_focus
+        assert not app.watchlist.items
+        await pilot.press("enter")
+        assert "MSFT" in app.watchlist.items
+        assert app.query_one(WatchlistTable).has_focus
+        assert not app.query_one("#filter", Input).display
+
+
+async def test_ctrl_enter_looks_up_even_when_partial_local_match_exists(app, monkeypatch):
+    app.watchlist.add(WatchlistItem("AAPL"))
+    stocks = AsyncMock(return_value=[StockInfo("AA", "Alcoa", "Alcoa", "US", "USD", "stock")])
+    monkeypatch.setattr(app.client, "get_stocks", stocks)
+    async with app.run_test() as pilot:
+        await pilot.press("slash", "a", "a", "ctrl+enter")
+        await pilot.pause()
+        stocks.assert_awaited_once_with(["AA"])
+        assert app.query_one("#search-add", Button).has_focus
+
+
+async def test_keyboard_lookup_failure_retry_and_escape(app, monkeypatch):
+    from stock_terminal.api.exceptions import TossAPIError
+    stocks = AsyncMock(side_effect=[TossAPIError("offline"),
+        [StockInfo("AA", "Alcoa", "Alcoa", "US", "USD", "stock")]])
+    monkeypatch.setattr(app.client, "get_stocks", stocks)
+    async with app.run_test() as pilot:
+        await pilot.press("slash", "a", "a", "enter")
+        await pilot.pause()
+        assert app.query_one("#filter", Input).has_focus
+        assert app.query_one("#search-add", Button).disabled
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#search-add", Button).has_focus
+        await pilot.press("escape")
+        assert not app.query_one("#filter", Input).display
+        assert not app.watchlist.items
