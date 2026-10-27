@@ -1,5 +1,6 @@
 Screen { layout: vertical; }
-#filter { height: 3; }
+#filter { height: 3; display: none; }
+#filter.visible { display: block; }
 #summary { height: auto; padding: 0 1; color: $text-muted; }
 #panels { height: 1fr; }
 WatchlistTable { width: 3fr; height: 1fr; border: round $accent; }

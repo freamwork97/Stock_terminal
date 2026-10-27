@@ -382,10 +382,14 @@ class StockTerminalApp(App):
             self.query_one(WatchlistTable).focus()
 
     def action_focus_filter(self) -> None:
-        self.query_one("#filter", Input).focus()
+        search = self.query_one("#filter", Input)
+        search.add_class("visible")
+        search.focus()
 
     def action_clear_filter(self) -> None:
-        self.query_one("#filter", Input).value = ""
+        search = self.query_one("#filter", Input)
+        search.value = ""
+        search.remove_class("visible")
         self.query_one(WatchlistTable).focus()
 
     def action_sort_watchlist(self) -> None:

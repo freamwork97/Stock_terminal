@@ -30,12 +30,20 @@ async def test_filter_keyboard_and_responsive_layout(app):
     async with app.run_test(size=(100, 35)) as pilot:
         table = app.query_one(WatchlistTable)
         assert app.query_one("#panels").has_class("narrow")
-        await pilot.press("slash", "a", "a", "p", "l", "enter")
+        assert not app.query_one("#filter", Input).display
+        await pilot.press("slash")
+        assert app.query_one("#filter", Input).display
+        await pilot.press("a", "a", "p", "l", "enter")
         assert table.row_count == 1
         assert table.selected_symbol == "AAPL"
         assert table.has_focus
         await pilot.press("escape")
         assert table.row_count == 2
+        assert not app.query_one("#filter", Input).display
+        await pilot.press("slash")
+        assert app.query_one("#filter", Input).display
+        assert app.query_one("#filter", Input).value == ""
+        await pilot.press("escape")
         await pilot.resize_terminal(180, 40)
         await pilot.pause()
         assert not app.query_one("#panels").has_class("narrow")
