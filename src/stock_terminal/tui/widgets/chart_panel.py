@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from textual_plotext import PlotextPlot
 
 from stock_terminal.api.models import Candle
@@ -65,6 +67,15 @@ class ChartPanel(PlotextPlot):
         self.plt.title(f"{self.symbol} ({interval_label})")
 
         dates = [c.timestamp.strftime(strftime_fmt) for c in self._candles]
+        lower, upper = min(dates), max(dates)
+        if lower == upper:
+            center = datetime.strptime(lower, strftime_fmt)
+            padding = timedelta(minutes=1) if self.interval == "1m" else timedelta(days=1)
+            lower, upper = ((center - padding).strftime(strftime_fmt),
+                            (center + padding).strftime(strftime_fmt))
+        # Avoid plotext expanding one date far enough to reach pre-1970 ticks
+        # (datetime.fromtimestamp rejects these on Windows).
+        self.plt.xlim(lower, upper)
 
         if self.mode == "candle":
             data = {

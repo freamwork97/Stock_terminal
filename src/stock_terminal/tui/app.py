@@ -8,7 +8,7 @@ import time
 from textual import work, events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import DataTable, Footer, Header, Input, Static, Button
+from textual.widgets import DataTable, Header, Input, Static, Button
 
 from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
@@ -20,6 +20,7 @@ from stock_terminal.storage.preferences import Preferences, PreferencesError
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem, WatchlistError
 from stock_terminal.tui.screens.add_symbol import AddSymbolResult
 from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
+from stock_terminal.tui.screens.shortcuts import ShortcutsScreen
 from stock_terminal.tui.screens.set_alert import AlertResult, SetAlertScreen
 from stock_terminal.tui.widgets.chart_panel import ChartPanel
 from stock_terminal.tui.widgets.watchlist_table import WatchlistTable
@@ -46,6 +47,8 @@ class StockTerminalApp(App):
         ("slash", "focus_filter", "검색"),
         ("ctrl+enter", "lookup_from_search", "종목조회"),
         ("escape", "clear_filter", "검색해제"),
+        ("f1", "show_shortcuts", "명령 찾기"),
+        ("question_mark", "show_shortcuts", "명령 찾기"),
         ("q", "quit", "종료"),
     ]
 
@@ -90,7 +93,6 @@ class StockTerminalApp(App):
         with Horizontal(id="panels"):
             yield WatchlistTable(id="watchlist", stale_after=max(30.0, self.settings.poll_interval_seconds * 3))
             yield ChartPanel(id="chart")
-        yield Footer()
 
     async def on_mount(self) -> None:
         table = self.query_one(WatchlistTable)
@@ -453,6 +455,25 @@ class StockTerminalApp(App):
             table.alerts.reset(symbol)
             table.sync_rows(self.watchlist)
             self.notify(f"{symbol} 알림 {'재개' if item.alerts_enabled else '중지'}", timeout=2)
+
+    def action_show_shortcuts(self) -> None:
+        if isinstance(self.screen, ShortcutsScreen):
+            return
+        # Aliases share one menu row; show the actual action and primary key.
+        entries = {}
+        for key, action, label in self.BINDINGS:
+            if action != "show_shortcuts":
+                action = "focus_filter" if action == "add_symbol" else action
+                key = {"slash": "/", "escape": "Esc", "ctrl+enter": "Ctrl+Enter"}.get(key, key)
+                if action in entries:
+                    previous_key, _, previous_label = entries[action]
+                    entries[action] = (f"{previous_key}, {key}", action, previous_label)
+                else:
+                    entries[action] = (key, action, label)
+        async def execute(action: str | None) -> None:
+            if action is not None:
+                await self.run_action(action)
+        self.push_screen(ShortcutsScreen(tuple(entries.values())), execute)
 
     def action_alert_history(self) -> None:
         self.push_screen(AlertHistoryScreen(tuple(self.query_one(WatchlistTable).alerts.history)))

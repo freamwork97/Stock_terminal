@@ -318,3 +318,36 @@ async def test_alert_control_save_errors_keep_previous_state(app, monkeypatch):
         assert not app._sound_muted
         assert app.watchlist.items["AAPL"].alerts_enabled
         assert app.watchlist.items["AAPL"].alert_upper == Decimal("210")
+
+
+async def test_shortcuts_hidden_and_searchable_menu_executes_command(app):
+    from textual.widgets import Footer, DataTable
+    from stock_terminal.tui.screens.shortcuts import ShortcutsScreen
+    async with app.run_test() as pilot:
+        assert not app.query(Footer)
+        await pilot.press("f1")
+        assert isinstance(app.screen, ShortcutsScreen)
+        app.screen.query_one(Input).value = "음소거"
+        await pilot.pause()
+        assert app.screen.query_one(DataTable).row_count == 1
+        await pilot.press("enter", "enter")
+        assert not isinstance(app.screen, ShortcutsScreen)
+        assert app._sound_muted
+        await pilot.press("question_mark")
+        assert isinstance(app.screen, ShortcutsScreen)
+        await pilot.press("escape")
+        assert not isinstance(app.screen, ShortcutsScreen)
+
+
+async def test_command_menu_empty_result_and_f1_close(app):
+    from textual.widgets import DataTable
+    from stock_terminal.tui.screens.shortcuts import ShortcutsScreen
+    async with app.run_test() as pilot:
+        await pilot.press("f1")
+        app.screen.query_one(Input).value = "does-not-exist"
+        await pilot.pause()
+        assert app.screen.query_one(DataTable).row_count == 0
+        await pilot.press("enter")
+        assert isinstance(app.screen, ShortcutsScreen)
+        await pilot.press("f1")
+        assert not isinstance(app.screen, ShortcutsScreen)
