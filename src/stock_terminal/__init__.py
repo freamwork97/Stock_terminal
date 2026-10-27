@@ -13,11 +13,18 @@ def main() -> None:
     except (AttributeError, ValueError):
         pass
 
-    from stock_terminal.config import ConfigError, Settings
+    from stock_terminal.config import ConfigError, Settings, DATA_DIR
+    from stock_terminal.diagnostics import configure_logging, close_logging, record
+
+    notice = configure_logging(DATA_DIR / "logs")
+    if notice:
+        print(notice, file=sys.stderr)
 
     try:
         settings = Settings.load()
     except ConfigError as exc:
+        record("startup_failed", "configuration", error=exc)
+        close_logging()
         print(str(exc))
         sys.exit(1)
 
@@ -28,6 +35,16 @@ def main() -> None:
     try:
         app = StockTerminalApp(settings)
     except (WatchlistError, OSError) as exc:
+        record("startup_failed", "watchlist", error=exc)
+        close_logging()
         print(f"관심목록 초기화 실패: {exc}", file=sys.stderr)
         sys.exit(1)
-    app.run()
+    record("app_started", "runtime")
+    try:
+        app.run()
+    except Exception as exc:
+        record("app_crashed", "runtime", error=exc)
+        raise
+    finally:
+        record("app_stopped", "runtime")
+        close_logging()

@@ -12,6 +12,8 @@ from textual.widgets import DataTable, Footer, Header, Input, Static, Button
 
 from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
+from stock_terminal.diagnostics import HealthReporter, record
+from textual.worker import Worker, WorkerState
 from stock_terminal.config import TOSS_API_BASE_URL, WATCHLIST_PATH, Settings, ensure_data_dir
 from stock_terminal.storage.preferences import Preferences, PreferencesError
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem, WatchlistError
@@ -54,6 +56,7 @@ class StockTerminalApp(App):
     def __init__(self, settings: Settings) -> None:
         super().__init__()
         self.settings = settings
+        self._health = HealthReporter()
         ensure_data_dir()
         self.watchlist = Watchlist.load(WATCHLIST_PATH)
         self.client = TossInvestClient(
@@ -94,8 +97,10 @@ class StockTerminalApp(App):
         self._update_summary()
         table.focus()
         if self._preferences_notice:
+            record("preferences_invalid", "preferences")
             self.notify(self._preferences_notice, title="화면 설정", severity="warning", timeout=10)
         if self.watchlist.recovery_notice:
+            record("watchlist_recovered", "watchlist", count=len(self.watchlist.items))
             self.notify(self.watchlist.recovery_notice, title="관심목록 복구", severity="warning", timeout=20)
         self.poll_prices()
         self.poll_baselines()
@@ -112,8 +117,13 @@ class StockTerminalApp(App):
             operation(*args, **kwargs)
             return True
         except WatchlistError as exc:
+            record("operation_failed", "watchlist", error=exc)
             self.notify(str(exc), title="저장 오류", severity="error", timeout=10)
             return False
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.state == WorkerState.ERROR:
+            record("worker_failed", "worker", error=event.worker.error)
 
     # -- polling workers ----------------------------------------------------
 
@@ -137,13 +147,16 @@ class StockTerminalApp(App):
         ):
             if not requested:
                 continue
+            operation = "stock_prices" if fetch == self.client.get_prices else "index_prices"
             try:
                 prices = await fetch(requested)
                 current = {s for s in requested if self.watchlist.items.get(s) is items[s]}
                 price_map = {p.symbol: p for p in prices if p.symbol in current}
                 table.apply_prices(price_map, self.watchlist)
                 table.mark_missing(list(current), set(price_map))
+                self._health.report(operation, missing=len(current - price_map.keys()))
             except TossAPIError as exc:
+                self._health.report(operation, error=exc)
                 table.mark_failed([s for s in requested if self.watchlist.items.get(s) is items[s]])
                 errors.append(str(exc))
         table.border_subtitle = f"시세 오류: {'; '.join(errors)}" if errors else ""
@@ -189,6 +202,7 @@ class StockTerminalApp(App):
             if retry_key != today:
                 self._baseline_failures.pop(symbol, None)
             reference = None
+            failure = None
             try:
                 if not item.currency and not item.is_index:
                     stocks = await self.client.get_stocks([symbol])
@@ -204,8 +218,8 @@ class StockTerminalApp(App):
                 reference = await self.client.get_close_reference(
                     symbol, item.currency, is_index=item.is_index
                 )
-            except TossAPIError:
-                pass
+            except TossAPIError as exc:
+                failure = exc
             if self.watchlist.items.get(symbol) is not item:
                 return
             if reference is not None:
@@ -216,12 +230,14 @@ class StockTerminalApp(App):
                 ):
                     self._baseline_retry[symbol] = (today, time.monotonic() + 60.0)
                     return
+                record("baseline_updated", "baseline", count=1)
                 self._baseline_failures.pop(symbol, None)
                 delay = 60.0  # Retry a daily fallback; minute estimates are cached.
             else:
                 failures = min(self._baseline_failures.get(symbol, 0) + 1, 5)
                 self._baseline_failures[symbol] = failures
                 delay = min(60.0 * 2 ** (failures - 1), 900.0)
+                record("baseline_retry", "baseline", error=failure, count=failures, delay=delay)
             # Measure from completion, so slow failures never cause immediate retries.
             self._baseline_retry[symbol] = (today, time.monotonic() + delay)
 
@@ -259,7 +275,9 @@ class StockTerminalApp(App):
                     and self.watchlist.items.get(symbol) is item):
                 chart.show_candles(symbol, candles)
                 chart.border_subtitle = ""
+                self._health.report("chart")
         except TossAPIError as exc:
+            self._health.report("chart", error=exc)
             if (table.selected_symbol == symbol and chart.interval == interval
                     and self.watchlist.items.get(symbol) is item):
                 if not keep_data:
@@ -321,8 +339,10 @@ class StockTerminalApp(App):
             price_map = {p.symbol: p for p in prices if p.symbol == symbol}
             table.apply_prices(price_map, self.watchlist)
             table.mark_missing([symbol], set(price_map))
-        except TossAPIError:
+            self._health.report("single_price", missing=int(symbol not in price_map))
+        except TossAPIError as exc:
             if self.watchlist.items.get(symbol) is item:
+                self._health.report("single_price", error=exc)
                 table.mark_failed([symbol])
 
     def action_delete_symbol(self) -> None:
@@ -469,11 +489,13 @@ class StockTerminalApp(App):
                     self._search_result = AddSymbolResult(info.symbol, info.name, None, info.currency)
             if self._search_result is not None:
                 self._search_status = f"확인됨: {self._search_result.name} ({symbol}) — Enter로 관심목록에 추가합니다."
+                self._health.report("search")
                 add_button = self.query_one("#search-add", Button)
                 add_button.disabled = False
                 if self.query_one("#filter", Input).has_focus or self.query_one("#search-lookup", Button).has_focus:
                     add_button.focus()
         except TossAPIError as exc:
+            self._health.report("search", error=exc)
             self._search_status = f"조회 실패: {exc} — Enter로 다시 시도하세요."
         self._update_summary()
 
@@ -515,6 +537,7 @@ class StockTerminalApp(App):
             preferences.save(self._preferences_path)
             self._preferences = preferences
         except PreferencesError as exc:
+            record("operation_failed", "preferences", error=exc)
             self.notify(str(exc), title="화면 설정", severity="error", timeout=10)
 
     def action_refresh_now(self) -> None:

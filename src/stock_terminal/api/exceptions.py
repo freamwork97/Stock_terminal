@@ -6,6 +6,10 @@ from __future__ import annotations
 class TossAPIError(Exception):
     """Base error for any failure talking to the Toss Invest Open API."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class TossAuthError(TossAPIError):
     """Raised when OAuth2 token issuance fails (bad client_id/client_secret)."""

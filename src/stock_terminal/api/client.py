@@ -215,7 +215,7 @@ class TossInvestClient:
                 raise TossRateLimitError(retry_after=wait)
 
         if response.status_code >= 400:
-            raise TossAPIError(f"{method} {path} -> {response.status_code}: {response.text}")
+            raise TossAPIError(f"{method} {path} -> {response.status_code}: {response.text}", status_code=response.status_code)
 
         return response
 
