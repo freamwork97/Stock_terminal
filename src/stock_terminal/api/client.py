@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, DecimalException
+from functools import wraps
+import math
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -103,6 +105,29 @@ def trading_day_key(currency: str) -> str:
     return date.today().isoformat()
 
 
+def _api_errors(method):
+    """Keep transport and malformed-response failures inside the API contract.
+
+    Cancellation deliberately propagates so exclusive Textual workers and
+    application shutdown can still cancel in-flight requests immediately.
+    """
+    @wraps(method)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await method(*args, **kwargs)
+        except TossAPIError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise TossAPIError("API 응답 시간 초과. 다음 갱신에서 다시 시도합니다.") from exc
+        except httpx.RequestError as exc:
+            raise TossAPIError("API 연결 실패. 다음 갱신에서 다시 시도합니다.") from exc
+        except httpx.HTTPStatusError as exc:
+            raise TossAPIError(f"API HTTP 오류: {exc.response.status_code}") from exc
+        except (ValueError, KeyError, TypeError, DecimalException, OverflowError) as exc:
+            raise TossAPIError("API 응답 형식 오류. 다음 갱신에서 다시 시도합니다.") from exc
+    return wrapped
+
+
 class TossInvestClient:
     def __init__(self, client_id: str, client_secret: str, base_url: str) -> None:
         self._client_id = client_id
@@ -123,6 +148,7 @@ class TossInvestClient:
 
     # -- OAuth -----------------------------------------------------------
 
+    @_api_errors
     async def _ensure_token(self, *, force: bool = False) -> str:
         async with self._token_lock:
             now = time.monotonic()
@@ -158,6 +184,7 @@ class TossInvestClient:
 
     # -- low-level request with 401/403/429 handling ----------------------
 
+    @_api_errors
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         token = await self._ensure_token()
         headers = kwargs.pop("headers", {})
@@ -175,7 +202,13 @@ class TossInvestClient:
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else 1.0
+            try:
+                wait = float(retry_after) if retry_after else 1.0
+            except ValueError:
+                wait = 1.0
+            if not math.isfinite(wait) or wait < 0:
+                wait = 1.0
+            wait = min(wait, 60.0)
             await asyncio.sleep(wait)
             response = await self._http.request(method, path, headers=headers, **kwargs)
             if response.status_code == 429:
@@ -188,6 +221,7 @@ class TossInvestClient:
 
     # -- public endpoints ---------------------------------------------------
 
+    @_api_errors
     async def get_prices(self, symbols: list[str]) -> list[Price]:
         if not symbols:
             return []
@@ -200,6 +234,7 @@ class TossInvestClient:
             results.extend(Price.from_json(item) for item in data["result"])
         return results
 
+    @_api_errors
     async def get_stocks(self, symbols: list[str]) -> list[StockInfo]:
         if not symbols:
             return []
@@ -212,6 +247,7 @@ class TossInvestClient:
             results.extend(StockInfo.from_json(item) for item in data["result"])
         return results
 
+    @_api_errors
     async def get_candles(
         self,
         symbol: str,
@@ -231,6 +267,7 @@ class TossInvestClient:
             Candle.from_json(item) for item in data["candles"] if item.get("timestamp")
         ]
 
+    @_api_errors
     async def get_market_indicator_prices(self, symbols: list[str]) -> list[Price]:
         if not symbols:
             return []
@@ -247,6 +284,7 @@ class TossInvestClient:
             )
         return results
 
+    @_api_errors
     async def get_market_indicator_candles(
         self,
         symbol: str,
@@ -265,6 +303,7 @@ class TossInvestClient:
             Candle.from_json(item) for item in data["candles"] if item.get("timestamp")
         ]
 
+    @_api_errors
     async def get_index_previous_close(self, symbol: str) -> Decimal | None:
         """Previous close for a KOSPI/KOSDAQ-style index (see INDEX_CATALOG).
 
@@ -276,6 +315,7 @@ class TossInvestClient:
             symbol, _KRX_SESSION, candle_fetcher=self.get_market_indicator_candles
         )
 
+    @_api_errors
     async def get_previous_close(
         self, symbol: str, currency: str | None = None
     ) -> Decimal | None:

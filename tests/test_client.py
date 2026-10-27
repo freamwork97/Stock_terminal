@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, time as dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -589,3 +590,92 @@ def test_trading_day_key_flips_at_session_close(
     monkeypatch.setattr(client_module, "datetime", _FrozenDateTime)
 
     assert trading_day_key("USD") == expected
+
+
+@pytest.mark.parametrize("endpoint", ["/oauth2/token", "/api/v1/prices"])
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
+@respx.mock
+async def test_transport_errors_are_api_errors(client, endpoint, error_type):
+    from stock_terminal.api.exceptions import TossAPIError
+
+    _token_route()
+    route = (respx.post if endpoint == "/oauth2/token" else respx.get)(BASE_URL + endpoint)
+    route.mock(side_effect=error_type("offline"))
+    with pytest.raises(TossAPIError):
+        await client.get_prices(["AAPL"])
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"result": None}, {"result": [{}]},
+    {"result": [{"symbol": "AAPL", "timestamp": "invalid", "lastPrice": "1", "currency": "USD"}]},
+    {"result": [{"symbol": "AAPL", "timestamp": None, "lastPrice": "bad", "currency": "USD"}]}])
+@respx.mock
+async def test_malformed_prices_are_api_errors(client, payload):
+    from stock_terminal.api.exceptions import TossAPIError
+
+    _token_route()
+    respx.get(BASE_URL + "/api/v1/prices").respond(200, content="invalid" if payload is None else json.dumps(payload))
+    with pytest.raises(TossAPIError):
+        await client.get_prices(["AAPL"])
+
+
+@respx.mock
+async def test_token_server_error_is_api_error(client):
+    from stock_terminal.api.exceptions import TossAPIError
+
+    respx.post(BASE_URL + "/oauth2/token").respond(503)
+    with pytest.raises(TossAPIError, match="503"):
+        await client.get_prices(["AAPL"])
+
+
+@respx.mock
+async def test_request_cancellation_propagates(client, monkeypatch):
+    import asyncio
+
+    _token_route()
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(client._http, "request", AsyncMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await client.get_prices(["AAPL"])
+
+
+@pytest.mark.parametrize("retry_after, expected", [("bad", 1.0), ("nan", 1.0), ("-1", 1.0), ("999999", 60.0)])
+@respx.mock
+async def test_invalid_retry_after_is_bounded(client, monkeypatch, retry_after, expected):
+    from unittest.mock import AsyncMock
+    from stock_terminal.api.exceptions import TossRateLimitError
+
+    sleep = AsyncMock()
+    monkeypatch.setattr("stock_terminal.api.client.asyncio.sleep", sleep)
+    _token_route()
+    respx.get(BASE_URL + "/api/v1/prices").respond(429, headers={"Retry-After": retry_after})
+    with pytest.raises(TossRateLimitError):
+        await client.get_prices(["AAPL"])
+    sleep.assert_awaited_once_with(expected)
+
+
+@pytest.mark.parametrize("payload", [{}, {"access_token": "test", "expires_in": "bad"}])
+@respx.mock
+async def test_invalid_token_response_is_api_error(client, payload):
+    from stock_terminal.api.exceptions import TossAPIError
+
+    respx.post(BASE_URL + "/oauth2/token").respond(200, json=payload)
+    with pytest.raises(TossAPIError):
+        await client.get_prices(["AAPL"])
+
+
+@pytest.mark.parametrize("method, path", [
+    ("get_stocks", "/api/v1/stocks"),
+    ("get_candles", "/api/v1/candles"),
+    ("get_market_indicator_prices", "/api/v1/market-indicators/prices"),
+    ("get_market_indicator_candles", "/api/v1/market-indicators/KOSPI/candles"),
+])
+@respx.mock
+async def test_other_endpoints_normalize_malformed_responses(client, method, path):
+    from stock_terminal.api.exceptions import TossAPIError
+
+    _token_route()
+    respx.get(BASE_URL + path).respond(200, json={})
+    argument = "KOSPI" if "candles" in method else ["KOSPI"]
+    with pytest.raises(TossAPIError):
+        await getattr(client, method)(argument)
