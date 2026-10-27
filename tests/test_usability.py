@@ -163,3 +163,47 @@ async def test_unified_search_existing_match_does_not_call_api(app, monkeypatch)
         assert app.query_one(WatchlistTable).has_focus
         assert app.query_one(WatchlistTable).selected_symbol == "AAPL"
         stocks.assert_not_awaited()
+
+
+async def test_reordering_same_symbol_does_not_reload_chart(app, monkeypatch):
+    from stock_terminal.api.models import Price
+    from stock_terminal.api.client import trading_day_key
+    for symbol in ("AAPL", "MSFT"):
+        app.watchlist.add(WatchlistItem(symbol, currency="USD", prev_close=Decimal("100"),
+            prev_close_source="minute_estimate", prev_close_date=trading_day_key("USD")))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        count = app.client.get_candles.await_count
+        table = app.query_one(WatchlistTable)
+        table.sort_mode = "등락률순"
+        table.apply_prices({"MSFT": Price("MSFT", Decimal("120"), "USD", None)}, app.watchlist)
+        await pilot.pause()
+        assert table.selected_symbol == "AAPL"
+        assert app.client.get_candles.await_count == count
+
+
+async def test_chart_refresh_retains_data_during_wait_and_failure(app, monkeypatch):
+    import asyncio
+    from datetime import datetime, timezone
+    from stock_terminal.api.models import Candle
+    from stock_terminal.api.exceptions import TossAPIError
+    app.watchlist.add(WatchlistItem("AAPL"))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        chart = app.query_one(ChartPanel)
+        candles = [Candle(datetime.now(timezone.utc), *(Decimal("100"),)*5)]
+        chart.show_candles("AAPL", candles)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def blocked(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            raise TossAPIError("offline")
+        monkeypatch.setattr(app.client, "get_candles", blocked)
+        worker = app.load_chart()
+        await asyncio.wait_for(entered.wait(), 2)
+        assert chart._candles == candles
+        assert chart.symbol == "AAPL"
+        release.set()
+        await worker.wait()
+        assert chart._candles == candles
+        assert str(chart.border_subtitle) == "offline"

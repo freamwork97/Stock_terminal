@@ -62,6 +62,7 @@ class StockTerminalApp(App):
         self._search_result: AddSymbolResult | None = None
         self._search_worker = None
         self._search_status = ""
+        self._chart_target = None
         self._baseline_retry: dict[str, tuple[str, float]] = {}
         self._baseline_failures: dict[str, int] = {}
         self._baseline_slots = asyncio.Semaphore(3)
@@ -223,12 +224,16 @@ class StockTerminalApp(App):
         table = self.query_one(WatchlistTable)
         chart = self.query_one(ChartPanel)
         symbol = table.selected_symbol
+        self._chart_target = (symbol, chart.interval, id(self.watchlist.items.get(symbol)))
         if not symbol:
             chart.clear_chart("표시할 종목 없음 — a: 추가 / Esc: 검색 해제")
             return
         item = self.watchlist.items.get(symbol)
         interval = chart.interval
-        chart.clear_chart(f"{symbol} 차트 조회 중…")
+        keep_data = chart.symbol == symbol and chart.data_interval == interval and bool(chart._candles)
+        if not keep_data:
+            chart.clear_chart(f"{symbol} 차트 조회 중…")
+        chart.border_subtitle = "갱신 중…"
         try:
             if item is not None and item.is_index:
                 candles = await self.client.get_market_indicator_candles(
@@ -243,11 +248,16 @@ class StockTerminalApp(App):
                 chart.border_subtitle = ""
         except TossAPIError as exc:
             if table.selected_symbol == symbol and chart.interval == interval:
-                chart.clear_chart(f"{symbol} 차트 조회 실패 — r: 재시도")
+                if not keep_data:
+                    chart.clear_chart(f"{symbol} 차트 조회 실패 — r: 재시도")
                 chart.border_subtitle = str(exc)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        self.load_chart()
+        symbol = self.query_one(WatchlistTable).selected_symbol
+        target = (symbol, self.query_one(ChartPanel).interval, id(self.watchlist.items.get(symbol)))
+        if target != self._chart_target:
+            self._chart_target = target
+            self.load_chart()
 
     # -- actions --------------------------------------------------------------
 

@@ -19,6 +19,7 @@ class ChartPanel(PlotextPlot):
         super().__init__(**kwargs)
         self.symbol: str | None = None
         self.interval: str = "1d"
+        self.data_interval: str | None = None
         self.mode: str = "candle"  # "candle" or "line"
         self._candles: list[Candle] = []
 
@@ -28,6 +29,7 @@ class ChartPanel(PlotextPlot):
 
     def clear_chart(self, message: str) -> None:
         self.symbol = None
+        self.data_interval = None
         self._candles = []
         self._show_placeholder(message)
 
@@ -40,6 +42,7 @@ class ChartPanel(PlotextPlot):
 
     def show_candles(self, symbol: str, candles: list[Candle]) -> None:
         self.symbol = symbol
+        self.data_interval = self.interval
         self._candles = candles
         self._replot()
 
