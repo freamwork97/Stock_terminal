@@ -13,6 +13,7 @@ from textual.widgets import DataTable, Footer, Header, Input, Static, Button
 from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
 from stock_terminal.config import TOSS_API_BASE_URL, WATCHLIST_PATH, Settings, ensure_data_dir
+from stock_terminal.storage.preferences import Preferences, PreferencesError
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem, WatchlistError
 from stock_terminal.tui.screens.add_symbol import AddSymbolResult
 from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
@@ -57,7 +58,9 @@ class StockTerminalApp(App):
         self.client = TossInvestClient(
             settings.client_id, settings.client_secret, TOSS_API_BASE_URL
         )
-        self._view_mode = "both"
+        self._preferences_path = WATCHLIST_PATH.with_name("preferences.json")
+        self._preferences, self._preferences_notice = Preferences.load(self._preferences_path)
+        self._view_mode = self._preferences.view_mode
         self._deleted_item: WatchlistItem | None = None
         self._search_result: AddSymbolResult | None = None
         self._search_worker = None
@@ -81,9 +84,16 @@ class StockTerminalApp(App):
 
     async def on_mount(self) -> None:
         table = self.query_one(WatchlistTable)
+        table.sort_mode = self._preferences.sort_mode
+        chart = self.query_one(ChartPanel)
+        chart.mode = self._preferences.chart_mode
+        chart.interval = self._preferences.chart_interval
+        self._apply_view()
         table.sync_rows(self.watchlist)
         self._update_summary()
         table.focus()
+        if self._preferences_notice:
+            self.notify(self._preferences_notice, title="화면 설정", severity="warning", timeout=10)
         if self.watchlist.recovery_notice:
             self.notify(self.watchlist.recovery_notice, title="관심목록 복구", severity="warning", timeout=20)
         self.poll_prices()
@@ -472,6 +482,17 @@ class StockTerminalApp(App):
         table.sort_mode = modes[(modes.index(table.sort_mode) + 1) % len(modes)]
         table.sort_rows()
         self._update_summary()
+        self._save_preferences()
+
+    def _save_preferences(self) -> None:
+        chart = self.query_one(ChartPanel)
+        preferences = Preferences(self._view_mode, self.query_one(WatchlistTable).sort_mode,
+                                  chart.mode, chart.interval)
+        try:
+            preferences.save(self._preferences_path)
+            self._preferences = preferences
+        except PreferencesError as exc:
+            self.notify(str(exc), title="화면 설정", severity="error", timeout=10)
 
     def action_refresh_now(self) -> None:
         self.poll_prices()
@@ -486,17 +507,22 @@ class StockTerminalApp(App):
         idx = self._VIEW_MODES.index(self._view_mode)
         self._view_mode = self._VIEW_MODES[(idx + 1) % len(self._VIEW_MODES)]
 
+        self._apply_view()
+        self._save_preferences()
+        self.notify(self._VIEW_MODE_LABELS[self._view_mode], timeout=1.5)
+
+    def _apply_view(self) -> None:
         table = self.query_one(WatchlistTable)
         chart = self.query_one(ChartPanel)
         table.display = self._view_mode in ("both", "list")
         chart.display = self._view_mode in ("both", "chart")
 
-        self.notify(self._VIEW_MODE_LABELS[self._view_mode], timeout=1.5)
-
     def action_toggle_chart_mode(self) -> None:
         self.query_one(ChartPanel).toggle_mode()
+        self._save_preferences()
 
     def action_toggle_interval(self) -> None:
         chart = self.query_one(ChartPanel)
         chart.toggle_interval()
+        self._save_preferences()
         self.load_chart()
