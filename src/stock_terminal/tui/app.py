@@ -8,13 +8,13 @@ import time
 from textual import work, events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, Static, Button
 
-from stock_terminal.api.client import TossInvestClient, trading_day_key as _trading_day_key
+from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
 from stock_terminal.config import TOSS_API_BASE_URL, WATCHLIST_PATH, Settings, ensure_data_dir
 from stock_terminal.storage.watchlist import Watchlist, WatchlistItem, WatchlistError
-from stock_terminal.tui.screens.add_symbol import AddSymbolResult, AddSymbolScreen
+from stock_terminal.tui.screens.add_symbol import AddSymbolResult
 from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
 from stock_terminal.tui.screens.set_alert import AlertResult, SetAlertScreen
 from stock_terminal.tui.widgets.chart_panel import ChartPanel
@@ -27,7 +27,7 @@ class StockTerminalApp(App):
     TITLE = "Stock Terminal"
     CSS_PATH = "app.tcss"
     BINDINGS = [
-        ("a", "add_symbol", "종목추가"),
+        ("a", "add_symbol", "검색·추가"),
         ("d", "delete_symbol", "삭제"),
         ("u", "undo_delete", "삭제취소"),
         ("t", "set_alert", "알림설정"),
@@ -59,13 +59,19 @@ class StockTerminalApp(App):
         )
         self._view_mode = "both"
         self._deleted_item: WatchlistItem | None = None
+        self._search_result: AddSymbolResult | None = None
+        self._search_worker = None
+        self._search_status = ""
         self._baseline_retry: dict[str, tuple[str, float]] = {}
         self._baseline_failures: dict[str, int] = {}
         self._baseline_slots = asyncio.Semaphore(3)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Input(placeholder="심볼·종목명 검색 (/ 포커스, Esc 해제)", id="filter")
+        yield Input(placeholder="관심종목 검색 · 없는 종목은 코드 입력 후 Enter로 조회", id="filter")
+        with Horizontal(id="search-actions"):
+            yield Button("종목 조회", id="search-lookup", variant="primary")
+            yield Button("관심목록에 추가", id="search-add", variant="success", disabled=True)
         yield Static("", id="summary")
         with Horizontal(id="panels"):
             yield WatchlistTable(id="watchlist", stale_after=max(30.0, self.settings.poll_interval_seconds * 3))
@@ -246,7 +252,7 @@ class StockTerminalApp(App):
     # -- actions --------------------------------------------------------------
 
     def action_add_symbol(self) -> None:
-        self.push_screen(AddSymbolScreen(self.client), self._on_symbol_added)
+        self.action_focus_filter()
 
     def _on_symbol_added(self, result: AddSymbolResult | None) -> None:
         if result is None:
@@ -366,11 +372,12 @@ class StockTerminalApp(App):
         if not self.watchlist.items:
             message = "관심종목이 없습니다 — a 키로 종목을 추가하세요."
         elif not table.row_count:
-            message = "검색 결과가 없습니다 — Esc 키로 검색을 해제하세요."
-        self.query_one("#summary", Static).update(message)
+            message = "관심목록에 없습니다 — 정확한 종목 코드 입력 후 Enter로 조회·추가하세요."
+        self.query_one("#summary", Static).update(self._search_status or message)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "filter":
+            self._invalidate_search()
             table = self.query_one(WatchlistTable)
             table.filter_text = event.value
             table.sync_rows(self.watchlist)
@@ -379,18 +386,76 @@ class StockTerminalApp(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "filter":
-            self.query_one(WatchlistTable).focus()
+            if self.query_one(WatchlistTable).row_count:
+                self.query_one(WatchlistTable).focus()
+            else:
+                self._search_worker = self.lookup_search()
 
     def action_focus_filter(self) -> None:
         search = self.query_one("#filter", Input)
         search.add_class("visible")
+        self.query_one("#search-actions").add_class("visible")
         search.focus()
 
     def action_clear_filter(self) -> None:
         search = self.query_one("#filter", Input)
+        self._invalidate_search()
         search.value = ""
+        self.query_one("#search-actions").remove_class("visible")
         search.remove_class("visible")
         self.query_one(WatchlistTable).focus()
+
+    def _invalidate_search(self) -> None:
+        if self._search_worker is not None:
+            self._search_worker.cancel()
+            self._search_worker = None
+        self._search_result = None
+        self._search_status = ""
+        self.query_one("#search-add", Button).disabled = True
+
+    @work(exclusive=True, group="search")
+    async def lookup_search(self) -> None:
+        self._search_result = None
+        self.query_one("#search-add", Button).disabled = True
+        raw = self.query_one("#filter", Input).value.strip().upper()
+        symbol = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}.get(raw, raw)
+        if not symbol:
+            return
+        self._search_status = f"{symbol} 조회 중…"
+        self._update_summary()
+        try:
+            if symbol in self.watchlist.items:
+                self._search_status = f"{symbol}은 이미 관심목록에 있습니다."
+            elif symbol in INDEX_CATALOG:
+                prices = await self.client.get_market_indicator_prices([symbol])
+                if not any(price.symbol == symbol for price in prices):
+                    self._search_status = f"{symbol} 지수를 찾을 수 없습니다."
+                else:
+                    self._search_result = AddSymbolResult(symbol, INDEX_CATALOG[symbol], None, "PT", is_index=True)
+            else:
+                stocks = await self.client.get_stocks([symbol])
+                info = next((stock for stock in stocks if stock.symbol == symbol), None)
+                if info is None:
+                    self._search_status = f"{symbol}을 찾을 수 없습니다. 정확한 종목 코드를 입력하세요."
+                else:
+                    self._search_result = AddSymbolResult(info.symbol, info.name, None, info.currency)
+            if self._search_result is not None:
+                self._search_status = f"확인됨: {self._search_result.name} ({symbol}) — 관심목록에 추가 버튼을 누르세요."
+                self.query_one("#search-add", Button).disabled = False
+        except TossAPIError as exc:
+            self._search_status = f"조회 실패: {exc} — Enter로 다시 시도하세요."
+        self._update_summary()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "search-lookup":
+            self._search_worker = self.lookup_search()
+        elif event.button.id == "search-add" and self._search_result is not None:
+            result = self._search_result
+            self._on_symbol_added(result)
+            if result.symbol in self.watchlist.items:
+                self.action_clear_filter()
+                table = self.query_one(WatchlistTable)
+                table.move_cursor(row=table.get_row_index(result.symbol), animate=False)
 
     def action_sort_watchlist(self) -> None:
         table = self.query_one(WatchlistTable)

@@ -8,3 +8,6 @@ ChartPanel { width: 2fr; height: 1fr; border: round $accent; }
 #panels.narrow { layout: vertical; }
 #panels.narrow WatchlistTable { width: 1fr; height: 1fr; }
 #panels.narrow ChartPanel { width: 1fr; height: 1fr; }
+
+#search-actions { display: none; height: 3; }
+#search-actions.visible { display: block; }

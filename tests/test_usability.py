@@ -121,3 +121,45 @@ async def test_chart_error_survives_successful_price_refresh(app, monkeypatch):
         assert str(chart.border_subtitle) == "chart offline"
         await app._refresh_prices(app.query_one(WatchlistTable))
         assert str(chart.border_subtitle) == "chart offline"
+
+
+async def test_unified_search_looks_up_and_adds_missing_symbol(app, monkeypatch):
+    stocks = AsyncMock(return_value=[StockInfo("MSFT", "Microsoft", "Microsoft", "US", "USD", "stock")])
+    monkeypatch.setattr(app.client, "get_stocks", stocks)
+    monkeypatch.setattr(app.client, "get_prices", AsyncMock(return_value=[]))
+    async with app.run_test() as pilot:
+        await pilot.press("a")
+        assert app.query_one("#filter", Input).display
+        await pilot.press("m", "s", "f", "t", "enter")
+        await pilot.pause()
+        stocks.assert_awaited_once_with(["MSFT"])
+        assert not app.query_one("#search-add", Button).disabled
+        assert "MSFT" not in app.watchlist.items
+        await pilot.click("#search-add")
+        assert "MSFT" in app.watchlist.items
+        assert not app.query_one("#filter", Input).display
+        assert app.query_one(WatchlistTable).selected_symbol == "MSFT"
+
+
+async def test_unified_search_edit_invalidates_verified_result(app, monkeypatch):
+    monkeypatch.setattr(app.client, "get_stocks", AsyncMock(return_value=[StockInfo("MSFT", "Microsoft", "Microsoft", "US", "USD", "stock")]))
+    async with app.run_test() as pilot:
+        await pilot.press("slash", "m", "s", "f", "t", "enter")
+        await pilot.pause()
+        assert not app.query_one("#search-add", Button).disabled
+        app.query_one("#filter", Input).value = "AAPL"
+        await pilot.pause()
+        assert app.query_one("#search-add", Button).disabled
+        assert app._search_result is None
+        assert not app.watchlist.items
+
+
+async def test_unified_search_existing_match_does_not_call_api(app, monkeypatch):
+    app.watchlist.add(WatchlistItem("AAPL", name="Apple"))
+    stocks = AsyncMock()
+    monkeypatch.setattr(app.client, "get_stocks", stocks)
+    async with app.run_test() as pilot:
+        await pilot.press("a", "a", "p", "p", "l", "e", "enter")
+        assert app.query_one(WatchlistTable).has_focus
+        assert app.query_one(WatchlistTable).selected_symbol == "AAPL"
+        stocks.assert_not_awaited()
