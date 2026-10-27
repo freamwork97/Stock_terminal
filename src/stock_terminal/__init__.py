@@ -23,4 +23,11 @@ def main() -> None:
 
     from stock_terminal.tui.app import StockTerminalApp
 
-    StockTerminalApp(settings).run()
+    from stock_terminal.storage.watchlist import WatchlistError
+
+    try:
+        app = StockTerminalApp(settings)
+    except (WatchlistError, OSError) as exc:
+        print(f"관심목록 초기화 실패: {exc}", file=sys.stderr)
+        sys.exit(1)
+    app.run()

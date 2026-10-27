@@ -13,7 +13,7 @@ from textual.widgets import DataTable, Footer, Header
 from stock_terminal.api.client import TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
 from stock_terminal.config import TOSS_API_BASE_URL, WATCHLIST_PATH, Settings, ensure_data_dir
-from stock_terminal.storage.watchlist import Watchlist, WatchlistItem
+from stock_terminal.storage.watchlist import Watchlist, WatchlistItem, WatchlistError
 from stock_terminal.tui.screens.add_symbol import AddSymbolResult, AddSymbolScreen
 from stock_terminal.tui.screens.alert_history import AlertHistoryScreen
 from stock_terminal.tui.screens.set_alert import AlertResult, SetAlertScreen
@@ -47,11 +47,11 @@ class StockTerminalApp(App):
     def __init__(self, settings: Settings) -> None:
         super().__init__()
         self.settings = settings
+        ensure_data_dir()
+        self.watchlist = Watchlist.load(WATCHLIST_PATH)
         self.client = TossInvestClient(
             settings.client_id, settings.client_secret, TOSS_API_BASE_URL
         )
-        ensure_data_dir()
-        self.watchlist = Watchlist.load(WATCHLIST_PATH)
         self._view_mode = "both"
         self._baseline_retry: dict[str, tuple[str, float]] = {}
         self._baseline_failures: dict[str, int] = {}
@@ -67,6 +67,8 @@ class StockTerminalApp(App):
     async def on_mount(self) -> None:
         table = self.query_one(WatchlistTable)
         table.sync_rows(self.watchlist)
+        if self.watchlist.recovery_notice:
+            self.notify(self.watchlist.recovery_notice, title="관심목록 복구", severity="warning", timeout=20)
         self.poll_prices()
         self.poll_baselines()
         self.poll_chart()
@@ -76,6 +78,14 @@ class StockTerminalApp(App):
         self.workers.cancel_all()
         await asyncio.gather(*(worker.wait() for worker in workers), return_exceptions=True)
         await self.client.aclose()
+
+    def _persist(self, operation, *args, **kwargs) -> bool:
+        try:
+            operation(*args, **kwargs)
+            return True
+        except WatchlistError as exc:
+            self.notify(str(exc), title="저장 오류", severity="error", timeout=10)
+            return False
 
     # -- polling workers ----------------------------------------------------
 
@@ -157,7 +167,9 @@ class StockTerminalApp(App):
                     info = next((stock for stock in stocks if stock.symbol == symbol), None)
                     if info is None or not info.currency:
                         raise TossAPIError("종목 통화 정보를 찾을 수 없습니다.")
-                    self.watchlist.set_currency(symbol, info.currency)
+                    if not self._persist(self.watchlist.set_currency, symbol, info.currency):
+                        self._baseline_retry[symbol] = (today, time.monotonic() + 60.0)
+                        return
                     today = _trading_day_key(item.currency)
                 reference = await self.client.get_close_reference(
                     symbol, item.currency, is_index=item.is_index
@@ -167,11 +179,13 @@ class StockTerminalApp(App):
             if self.watchlist.items.get(symbol) is not item:
                 return
             if reference is not None:
-                self.watchlist.set_prev_close(
-                    symbol, reference.value, today,
+                if not self._persist(
+                    self.watchlist.set_prev_close, symbol, reference.value, today,
                     session_date=reference.session_date, source=reference.source,
                     confirmed=reference.confirmed,
-                )
+                ):
+                    self._baseline_retry[symbol] = (today, time.monotonic() + 60.0)
+                    return
                 self._baseline_failures.pop(symbol, None)
                 delay = 60.0  # Retry a daily fallback; minute estimates are cached.
             else:
@@ -234,7 +248,8 @@ class StockTerminalApp(App):
         )
         self._baseline_retry.pop(result.symbol, None)
         self._baseline_failures.pop(result.symbol, None)
-        self.watchlist.add(item)
+        if not self._persist(self.watchlist.add, item):
+            return
         self.query_one(WatchlistTable).sync_rows(self.watchlist)
         self._refresh_one(result.symbol)
 
@@ -258,7 +273,8 @@ class StockTerminalApp(App):
         symbol = table.selected_symbol
         if not symbol:
             return
-        self.watchlist.remove(symbol)
+        if not self._persist(self.watchlist.remove, symbol):
+            return
         self._baseline_retry.pop(symbol, None)
         self._baseline_failures.pop(symbol, None)
         table.sync_rows(self.watchlist)
@@ -284,7 +300,8 @@ class StockTerminalApp(App):
         if item is None:
             return
         changed = (item.alert_upper, item.alert_lower) != (result.upper, result.lower)
-        self.watchlist.set_alerts(symbol, result.upper, result.lower)
+        if not self._persist(self.watchlist.set_alerts, symbol, result.upper, result.lower):
+            return
         if changed:
             self.query_one(WatchlistTable).alerts.reset(symbol)
 

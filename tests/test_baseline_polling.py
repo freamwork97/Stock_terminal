@@ -245,3 +245,17 @@ async def test_deleted_queued_symbol_is_not_fetched(app, monkeypatch):
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_storage_failure_does_not_stop_baseline_worker(app, monkeypatch):
+    from unittest.mock import Mock
+    add(app, "AAPL")
+    monkeypatch.setattr(app.client, "get_close_reference", AsyncMock(return_value=reference()))
+    monkeypatch.setattr(app, "notify", Mock())
+    def fail_replace(*args):
+        raise PermissionError("locked")
+    monkeypatch.setattr("stock_terminal.storage.watchlist.os.replace", fail_replace)
+    await app._refresh_stale_prev_closes(["AAPL"])
+    assert app.watchlist.items["AAPL"].prev_close is None
+    assert "AAPL" in app._baseline_retry
+    app.notify.assert_called_once()

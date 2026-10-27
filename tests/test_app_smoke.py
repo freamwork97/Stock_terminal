@@ -274,3 +274,54 @@ async def test_empty_alert_history_opens_and_closes(fake_settings, tmp_path, mon
             assert not isinstance(app.screen, AlertHistoryScreen)
     finally:
         await app.client.aclose()
+
+
+async def test_failed_user_save_keeps_rows_and_settings(fake_settings, tmp_path, monkeypatch):
+    from decimal import Decimal
+    from unittest.mock import Mock
+    from stock_terminal.storage.watchlist import WatchlistItem
+    from stock_terminal.tui.screens.set_alert import AlertResult
+
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", tmp_path / "watchlist.json")
+    app = StockTerminalApp(fake_settings)
+    monkeypatch.setattr(app, "poll_prices", lambda: None)
+    monkeypatch.setattr(app, "load_chart", lambda: None)
+    app.watchlist.add(WatchlistItem("AAPL", alert_upper=Decimal("210")))
+    notify = Mock()
+    monkeypatch.setattr(app, "notify", notify)
+    try:
+        async with app.run_test():
+            def fail_replace(*args):
+                raise PermissionError("locked")
+            monkeypatch.setattr("stock_terminal.storage.watchlist.os.replace", fail_replace)
+            app._on_alert_set("AAPL", AlertResult(Decimal("220"), None))
+            assert app.watchlist.items["AAPL"].alert_upper == Decimal("210")
+            app.action_delete_symbol()
+            assert app.watchlist.symbols == ["AAPL"]
+            assert app.query_one(WatchlistTable).row_count == 1
+            assert notify.call_count == 2
+            assert all(call.kwargs["severity"] == "error" for call in notify.call_args_list)
+    finally:
+        await app.client.aclose()
+
+
+async def test_recovery_notice_is_shown_on_mount(fake_settings, tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from stock_terminal.storage.watchlist import Watchlist, WatchlistItem
+
+    path = tmp_path / "watchlist.json"
+    watchlist = Watchlist(path)
+    watchlist.add(WatchlistItem("AAPL"))
+    path.write_bytes(b"broken")
+    monkeypatch.setattr("stock_terminal.tui.app.WATCHLIST_PATH", path)
+    app = StockTerminalApp(fake_settings)
+    monkeypatch.setattr(app, "poll_prices", lambda: None)
+    monkeypatch.setattr(app, "load_chart", lambda: None)
+    notify = Mock()
+    monkeypatch.setattr(app, "notify", notify)
+    try:
+        async with app.run_test():
+            assert app.query_one(WatchlistTable).row_count == 1
+            assert any(call.kwargs.get("title") == "관심목록 복구" for call in notify.call_args_list)
+    finally:
+        await app.client.aclose()
