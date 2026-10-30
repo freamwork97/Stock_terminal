@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+
 from stock_terminal.api.exceptions import (
     TossAPIError,
     TossAuthError,
@@ -130,6 +131,8 @@ def _api_errors(method):
 
 class TossInvestClient:
     def __init__(self, client_id: str, client_secret: str, base_url: str) -> None:
+        from stock_terminal.access_retry import AccessRetry
+
         self._client_id = client_id
         self._client_secret = client_secret
         self._http = httpx.AsyncClient(base_url=base_url, timeout=10.0)
@@ -137,6 +140,7 @@ class TossInvestClient:
         self._token_expires_at: float = 0.0
         self._token_refresh_at: float = 0.0
         self._token_lock = asyncio.Lock()
+        self.access_retry = AccessRetry()
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -152,6 +156,7 @@ class TossInvestClient:
     @_api_errors
     async def _ensure_token(self, *, force: bool = False, rejected_token: str | None = None) -> str:
         async with self._token_lock:
+            self.access_retry.check()
             now = time.monotonic()
             if (force and rejected_token is not None and self._access_token is not None
                     and self._access_token != rejected_token and now < self._token_expires_at):
@@ -163,6 +168,7 @@ class TossInvestClient:
             ):
                 return self._access_token
 
+            access_version = self.access_retry.version
             response = await self._http.post(
                 "/oauth2/token",
                 data={
@@ -173,11 +179,13 @@ class TossInvestClient:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             if response.status_code in (401, 400):
-                raise TossAuthError(
-                    "OAuth 토큰 발급 실패: TOSS_CLIENT_ID/TOSS_CLIENT_SECRET 값을 확인하세요."
-                )
+                error = TossAuthError("OAuth 토큰 발급 실패: TOSS_CLIENT_ID/TOSS_CLIENT_SECRET 값을 확인하세요.")
+                self.access_retry.fail(error, version=access_version)
+                raise error
             if response.status_code == 403:
-                raise TossForbiddenError()
+                error = TossForbiddenError()
+                self.access_retry.fail(error, version=access_version)
+                raise error
             response.raise_for_status()
 
             payload = response.json()
@@ -204,7 +212,9 @@ class TossInvestClient:
 
     @_api_errors
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        self.access_retry.check()
         token = await self._ensure_token()
+        access_version = self.access_retry.version
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {token}"
 
@@ -216,7 +226,9 @@ class TossInvestClient:
             response = await self._http.request(method, path, headers=headers, **kwargs)
 
         if response.status_code == 403:
-            raise TossForbiddenError()
+            error = TossForbiddenError()
+            self.access_retry.fail(error, version=access_version)
+            raise error
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
@@ -232,9 +244,14 @@ class TossInvestClient:
             if response.status_code == 429:
                 raise TossRateLimitError(retry_after=wait)
 
+        if response.status_code in (401, 403):
+            error = TossForbiddenError() if response.status_code == 403 else TossAuthError("토큰 갱신 후에도 인증이 거부됐습니다.")
+            self.access_retry.fail(error, version=access_version)
+            raise error
         if response.status_code >= 400:
             raise TossAPIError(f"{method} {path} -> {response.status_code}: {response.text}", status_code=response.status_code)
 
+        self.access_retry.success(access_version)
         return response
 
     # -- public endpoints ---------------------------------------------------

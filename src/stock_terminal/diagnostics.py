@@ -102,11 +102,11 @@ def record(event: str, operation: str, *, error: BaseException | None = None,
             value = metrics.get(key)
             if type(value) is int and value >= 0:
                 payload[key] = value
-        for key in ("duration_seconds", "receive_age_seconds"):
+        for key in ("duration_seconds", "receive_age_seconds", "retry_seconds"):
             value = metrics.get(key)
             if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                 payload[key] = value
-        if metrics.get("state") in ("idle", "normal", "fetching", "slow", "stalled", "no_data", "failed"):
+        if metrics.get("state") in ("idle", "normal", "fetching", "slow", "stalled", "no_data", "failed", "access_wait"):
             payload["state"] = metrics["state"]
         if type(metrics.get("poll_in_progress")) is bool:
             payload["poll_in_progress"] = metrics["poll_in_progress"]

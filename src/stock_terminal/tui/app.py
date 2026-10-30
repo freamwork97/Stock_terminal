@@ -149,10 +149,13 @@ class StockTerminalApp(App):
         table = self.query_one(WatchlistTable)
         while True:
             await self._refresh_prices(table)
-            await asyncio.sleep(self.settings.poll_interval_seconds)
+            await asyncio.sleep(max(self.settings.poll_interval_seconds, self.client.access_retry.wait))
 
     async def _refresh_prices(self, table: WatchlistTable) -> None:
         items = dict(self.watchlist.items)
+        if self.client.access_retry.wait > 0:
+            self._update_poll_status()
+            return
         if not items:
             return
         self._poll_health.begin()
@@ -503,21 +506,30 @@ class StockTerminalApp(App):
     def _monitoring_details(self) -> str:
         self._update_summary()
         self._update_poll_status()
-        snapshot = self._poll_health.snapshot(self.settings.poll_interval_seconds, bool(self.watchlist.items))
+        snapshot = self._poll_snapshot()
         paused = sum(not item.alerts_enabled for item in self.watchlist.items.values())
-        return (f"{self._monitoring_summary}\n\n{self._monitoring_status}\n\n"
+        access = self.client.access_retry
+        access_text = (f"\n\n{access.guidance}\n다음 자동 재시도까지 {access.wait:.0f}초. 수동 새로고침으로 즉시 재시도할 수 있습니다.") if access.error else ""
+        return (f"{self._monitoring_summary}\n\n{self._monitoring_status}{access_text}\n\n"
                 f"알림 중지 종목 {paused}개\n"
                 f"누적 성공 {snapshot['success_count']} · 실패 {snapshot['failure_count']} · 누락 {snapshot['missing_count']}")
 
     def action_alert_history(self) -> None:
         self.push_screen(AlertHistoryScreen(tuple(self.query_one(WatchlistTable).alerts.history)))
 
+    def _poll_snapshot(self) -> dict:
+        snapshot = self._poll_health.snapshot(self.settings.poll_interval_seconds, bool(self.watchlist.items))
+        if self.client.access_retry.wait > 0 and self.watchlist.items:
+            snapshot["state"] = "access_wait"
+            snapshot["retry_seconds"] = round(self.client.access_retry.wait, 1)
+        return snapshot
+
     def _update_poll_status(self) -> None:
         if not self.query("#poll-status"):
             return
-        snapshot = self._poll_health.snapshot(self.settings.poll_interval_seconds, bool(self.watchlist.items))
+        snapshot = self._poll_snapshot()
         labels = {"idle": "대기", "normal": "정상", "fetching": "조회 중", "slow": "폴링 지연",
-                  "stalled": "갱신 중단 의심", "no_data": "수신 대기·지연", "failed": "조회 실패·누락"}
+                  "stalled": "갱신 중단 의심", "no_data": "수신 대기·지연", "failed": "조회 실패·누락", "access_wait": "인증·접근 재시도 대기"}
         received = self._poll_health.last_received
         received_text = received.astimezone().strftime("%m-%d %H:%M:%S") if received else "없음"
         message = (f"시세 {labels[snapshot['state']]} · 조회 {snapshot['duration_seconds']:.1f}초 "
@@ -526,11 +538,10 @@ class StockTerminalApp(App):
         self._monitoring_status = message
         status = self.query_one("#poll-status", Static)
         status.update(message)
-        status.set_class(snapshot["state"] in ("slow", "stalled", "failed", "no_data"), "warning")
+        status.set_class(snapshot["state"] in ("slow", "stalled", "failed", "no_data", "access_wait"), "warning")
 
     def _log_poll_status(self) -> None:
-        record("poll_status", "runtime", metrics=self._poll_health.snapshot(
-            self.settings.poll_interval_seconds, bool(self.watchlist.items)))
+        record("poll_status", "runtime", metrics=self._poll_snapshot())
 
     def _update_summary(self) -> None:
         if not self.query("#summary") or not self.query(WatchlistTable):
@@ -668,6 +679,7 @@ class StockTerminalApp(App):
             return False
 
     def action_refresh_now(self) -> None:
+        self.client.access_retry.retry_now()
         self.poll_prices()
         self.load_chart()
         self.notify("현재가와 차트를 새로고침합니다.", timeout=1.5)
