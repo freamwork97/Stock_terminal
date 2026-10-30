@@ -12,6 +12,7 @@ from textual.widgets import DataTable, Header, Input, Static, Button
 
 from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient, trading_day_key as _trading_day_key
 from stock_terminal.api.exceptions import TossAPIError
+from stock_terminal.quote_order import QuoteOrder
 from stock_terminal.polling import PollingHealth
 from stock_terminal.diagnostics import HealthReporter, record
 from textual.worker import Worker, WorkerState
@@ -65,6 +66,7 @@ class StockTerminalApp(App):
         super().__init__()
         self.settings = settings
         self._health = HealthReporter()
+        self._quote_order = QuoteOrder()
         self._monitoring_summary = ""
         self._monitoring_status = ""
         self._poll_health = PollingHealth()
@@ -171,19 +173,28 @@ class StockTerminalApp(App):
         async def fetch_group(requested, fetch, operation):
             if not requested:
                 return
+            request_id = self._quote_order.begin(self.watchlist.items)
             try:
                 prices = await fetch(requested)
                 current = {s for s in requested if self.watchlist.items.get(s) is items[s]}
                 price_map = {p.symbol: p for p in prices if p.symbol in current}
-                self._poll_health.receive(len(price_map), missing=len(current - price_map.keys()))
-                table.apply_prices(price_map, self.watchlist)
-                table.mark_missing(list(current), set(price_map))
-                self._health.report(operation, missing=len(current - price_map.keys()))
+                eligible = {s for s in current if self._quote_order.is_current(s, items[s], request_id)}
+                missing = eligible - price_map.keys()
+                accepted = {s: p for s, p in price_map.items()
+                            if self._quote_order.accept(p, items[s], request_id)}
+                if accepted or missing:
+                    self._poll_health.receive(len(accepted), missing=len(missing))
+                    table.apply_prices(accepted, self.watchlist)
+                    table.mark_missing(list(missing), set())
+                    self._health.report(operation, missing=len(missing))
             except TossAPIError as exc:
-                self._poll_health.receive(0, failure=sum(self.watchlist.items.get(s) is items[s] for s in requested))
-                self._health.report(operation, error=exc)
-                table.mark_failed([s for s in requested if self.watchlist.items.get(s) is items[s]])
-                errors.append(str(exc))
+                failed = [s for s in requested if self.watchlist.items.get(s) is items[s]
+                          and self._quote_order.is_current(s, items[s], request_id)]
+                if failed:
+                    self._poll_health.receive(0, failure=len(failed))
+                    self._health.report(operation, error=exc)
+                    table.mark_failed(failed)
+                    errors.append(str(exc))
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(fetch_group(stock_symbols, self.client.get_prices, "stock_prices"))
             tasks.create_task(fetch_group(index_symbols, self.client.get_market_indicator_prices, "index_prices"))
@@ -357,6 +368,7 @@ class StockTerminalApp(App):
         item = self.watchlist.items.get(symbol)
         if item is None:
             return
+        request_id = self._quote_order.begin(self.watchlist.items)
         try:
             if item.is_index:
                 prices = await self.client.get_market_indicator_prices([symbol])
@@ -365,11 +377,18 @@ class StockTerminalApp(App):
             if self.watchlist.items.get(symbol) is not item:
                 return
             price_map = {p.symbol: p for p in prices if p.symbol == symbol}
-            table.apply_prices(price_map, self.watchlist)
-            table.mark_missing([symbol], set(price_map))
+            if not self._quote_order.is_current(symbol, item, request_id):
+                return
+            if symbol in price_map:
+                if not self._quote_order.accept(price_map[symbol], item, request_id):
+                    return
+                table.apply_prices(price_map, self.watchlist)
+            else:
+                table.mark_missing([symbol], set())
             self._health.report("single_price", missing=int(symbol not in price_map))
         except TossAPIError as exc:
-            if self.watchlist.items.get(symbol) is item:
+            if (self.watchlist.items.get(symbol) is item
+                    and self._quote_order.is_current(symbol, item, request_id)):
                 self._health.report("single_price", error=exc)
                 table.mark_failed([symbol])
 
