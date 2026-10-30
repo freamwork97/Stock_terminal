@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import os
 import tempfile
 from datetime import date
@@ -15,6 +16,35 @@ from pathlib import Path
 
 class WatchlistError(Exception):
     """Storage failure safe to display without losing the existing watchlist."""
+
+
+@contextmanager
+def _file_lock(path: Path):
+    """Serialize cooperating processes; OS releases locks if a process dies."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a+b") as stream:
+        stream.seek(0, 2)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise WatchlistError("다른 프로세스가 관심목록 파일을 사용 중입니다. 잠시 후 다시 시도하세요.") from exc
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -124,6 +154,7 @@ class Watchlist:
     items: dict[str, WatchlistItem] = field(default_factory=dict)
 
     recovery_notice: str | None = None
+    _disk_snapshot: bytes | None = field(default=None, repr=False)
 
     @property
     def backup_path(self) -> Path:
@@ -144,6 +175,14 @@ class Watchlist:
 
     @classmethod
     def load(cls, path: Path) -> Watchlist:
+        try:
+            with _file_lock(path):
+                return cls._load_locked(path)
+        except OSError as exc:
+            raise WatchlistError(f"관심목록 파일 접근/복구 실패: {path} ({exc})") from exc
+
+    @classmethod
+    def _load_locked(cls, path: Path) -> Watchlist:
         watchlist = cls(path=path)
         original = None
         try:
@@ -155,6 +194,7 @@ class Watchlist:
             if original is not None:
                 try:
                     watchlist.items = cls._decode(original)
+                    watchlist._disk_snapshot = original
                     return watchlist
                 except (ValueError, TypeError, KeyError, DecimalException):
                     pass
@@ -172,6 +212,7 @@ class Watchlist:
                 _atomic_write(preserved, original)
             _atomic_write(path, backup)
             watchlist.items = recovered
+            watchlist._disk_snapshot = backup
             watchlist.recovery_notice = (
                 f"관심목록을 백업에서 복구했습니다: {watchlist.backup_path}. "
                 "백업 이후 변경사항은 포함되지 않을 수 있습니다."
@@ -182,6 +223,13 @@ class Watchlist:
             raise WatchlistError(f"관심목록 파일 접근/복구 실패: {path} ({exc})") from exc
 
     def save(self) -> None:
+        try:
+            with _file_lock(self.path):
+                self._save_locked()
+        except OSError as exc:
+            raise WatchlistError(f"관심목록 저장 실패: {self.path} ({exc})") from exc
+
+    def _save_locked(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps([item.to_dict() for item in self.items.values()],
@@ -196,6 +244,9 @@ class Watchlist:
                 previous = self.backup_path.read_bytes() if backup_existed else payload
             # Never overwrite the last good backup with a corrupt primary.
             self._decode(previous)
+            observed = None if primary_missing and not backup_existed else previous
+            if observed != self._disk_snapshot:
+                raise WatchlistError("다른 실행에서 관심목록이 변경되어 저장을 중단했습니다. 프로그램을 다시 실행해 최신 목록을 불러오세요.")
             _atomic_write(self.backup_path, previous)
             try:
                 _atomic_write(self.path, payload)
@@ -204,6 +255,7 @@ class Watchlist:
                     # A failed first save must not resurrect an uncommitted edit.
                     self.backup_path.unlink(missing_ok=True)
                 raise
+            self._disk_snapshot = payload
         except (OSError, ValueError, TypeError, KeyError, DecimalException) as exc:
             raise WatchlistError(f"관심목록 저장 실패. 기존 파일을 유지합니다: {self.path} ({exc})") from exc
 

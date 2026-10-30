@@ -135,6 +135,7 @@ class TossInvestClient:
         self._http = httpx.AsyncClient(base_url=base_url, timeout=10.0)
         self._access_token: str | None = None
         self._token_expires_at: float = 0.0
+        self._token_refresh_at: float = 0.0
         self._token_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
@@ -149,13 +150,16 @@ class TossInvestClient:
     # -- OAuth -----------------------------------------------------------
 
     @_api_errors
-    async def _ensure_token(self, *, force: bool = False) -> str:
+    async def _ensure_token(self, *, force: bool = False, rejected_token: str | None = None) -> str:
         async with self._token_lock:
             now = time.monotonic()
+            if (force and rejected_token is not None and self._access_token is not None
+                    and self._access_token != rejected_token and now < self._token_expires_at):
+                return self._access_token
             if (
                 not force
                 and self._access_token is not None
-                and now < self._token_expires_at - TOKEN_REFRESH_MARGIN_SECONDS
+                and now < self._token_refresh_at
             ):
                 return self._access_token
 
@@ -177,10 +181,24 @@ class TossInvestClient:
             response.raise_for_status()
 
             payload = response.json()
-            self._access_token = payload["access_token"]
-            expires_in = float(payload.get("expires_in", 3600))
-            self._token_expires_at = now + expires_in
-            return self._access_token
+            token = payload["access_token"]
+            raw_expiry = payload.get("expires_in", 3600)
+            if (not isinstance(token, str) or not token.strip()
+                    or any(character.isspace() or ord(character) < 32 or ord(character) > 126 for character in token)
+                    or isinstance(raw_expiry, bool)):
+                raise ValueError("잘못된 인증 응답")
+            expires_in = float(raw_expiry)
+            if not math.isfinite(expires_in) or expires_in <= 0:
+                raise ValueError("잘못된 토큰 유효기간")
+            # Start validity when the request began; reject already expired tokens.
+            expires_at = now + expires_in
+            if not math.isfinite(expires_at) or expires_at <= time.monotonic():
+                raise ValueError("이미 만료된 인증 응답")
+            self._access_token = token
+            self._token_expires_at = expires_at
+            margin = min(TOKEN_REFRESH_MARGIN_SECONDS, expires_in * 0.1)
+            self._token_refresh_at = expires_at - margin
+            return token
 
     # -- low-level request with 401/403/429 handling ----------------------
 
@@ -193,7 +211,7 @@ class TossInvestClient:
         response = await self._http.request(method, path, headers=headers, **kwargs)
 
         if response.status_code == 401:
-            token = await self._ensure_token(force=True)
+            token = await self._ensure_token(force=True, rejected_token=token)
             headers["Authorization"] = f"Bearer {token}"
             response = await self._http.request(method, path, headers=headers, **kwargs)
 

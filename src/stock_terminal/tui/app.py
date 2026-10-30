@@ -168,13 +168,9 @@ class StockTerminalApp(App):
         stock_symbols = [s for s, item in items.items() if not item.is_index]
         index_symbols = [s for s, item in items.items() if item.is_index]
         errors = []
-        for requested, fetch in (
-            (stock_symbols, self.client.get_prices),
-            (index_symbols, self.client.get_market_indicator_prices),
-        ):
+        async def fetch_group(requested, fetch, operation):
             if not requested:
-                continue
-            operation = "stock_prices" if fetch == self.client.get_prices else "index_prices"
+                return
             try:
                 prices = await fetch(requested)
                 current = {s for s in requested if self.watchlist.items.get(s) is items[s]}
@@ -188,6 +184,9 @@ class StockTerminalApp(App):
                 self._health.report(operation, error=exc)
                 table.mark_failed([s for s in requested if self.watchlist.items.get(s) is items[s]])
                 errors.append(str(exc))
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(fetch_group(stock_symbols, self.client.get_prices, "stock_prices"))
+            tasks.create_task(fetch_group(index_symbols, self.client.get_market_indicator_prices, "index_prices"))
         table.border_subtitle = f"시세 오류: {'; '.join(errors)}" if errors else ""
         self._update_summary()
 
