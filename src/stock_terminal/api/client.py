@@ -23,6 +23,7 @@ from stock_terminal.api.exceptions import (
     TossAuthError,
     TossForbiddenError,
     TossRateLimitError,
+    TossPartialPricesError,
 )
 from stock_terminal.api.models import Candle, Price, StockInfo, CloseReference
 
@@ -258,16 +259,64 @@ class TossInvestClient:
 
     @_api_errors
     async def get_prices(self, symbols: list[str]) -> list[Price]:
-        if not symbols:
-            return []
-        results: list[Price] = []
+        return await self._get_price_batches(symbols, is_index=False)
+
+    async def _get_price_batches(self, symbols: list[str], *, is_index: bool) -> list[Price]:
+        results: dict[str, Price] = {}
+        failed: set[str] = set()
+        unknown_rows = 0
+        first_error = None
+        parser = Price.from_market_indicator_json if is_index else Price.from_json
+        path = "/api/v1/market-indicators/prices" if is_index else "/api/v1/prices"
         for batch in _chunk(symbols, MAX_SYMBOLS_PER_CALL):
-            response = await self._request(
-                "GET", "/api/v1/prices", params={"symbols": ",".join(batch)}
-            )
-            data = response.json()
-            results.extend(Price.from_json(item) for item in data["result"])
-        return results
+            requested = set(batch)
+            try:
+                response = await self._request("GET", path, params={"symbols": ",".join(batch)})
+                rows = response.json()["result"]
+                if not isinstance(rows, list):
+                    raise ValueError("시세 응답은 목록이어야 합니다.")
+            except (TossAPIError, ValueError, TypeError, KeyError, DecimalException) as exc:
+                first_error = first_error or exc
+                failed.update(requested)
+                continue
+            seen = set()
+            batch_good = {}
+            unknown = 0
+            for row in rows:
+                symbol = row.get("symbol") if isinstance(row, dict) else None
+                if not isinstance(symbol, str):
+                    unknown += 1
+                    continue
+                if symbol not in requested:
+                    continue
+                if symbol in seen:
+                    first_error = first_error or ValueError("중복된 시세 응답")
+                    failed.add(symbol)  # Ambiguous duplicates must not win by row order.
+                    batch_good.pop(symbol, None)
+                    continue
+                seen.add(symbol)
+                try:
+                    batch_good[symbol] = parser(row)
+                except (ValueError, TypeError, KeyError, DecimalException, OverflowError) as exc:
+                    first_error = first_error or exc
+                    failed.add(symbol)
+            if unknown:
+                first_error = first_error or ValueError("종목을 식별할 수 없는 시세 응답")
+                # An unidentifiable row must not invalidate identifiable good quotes.
+                failed.update(requested - batch_good.keys())
+                unknown_rows += unknown
+            results.update(batch_good)
+        for symbol in failed:
+            results.pop(symbol, None)
+        if failed:
+            # Preserve typed full-request auth/HTTP failures for existing callers.
+            if not results and isinstance(first_error, TossAPIError):
+                raise first_error
+            error = TossPartialPricesError(list(results.values()), failed, unknown_rows=unknown_rows)
+            if first_error is not None:
+                raise error from first_error
+            raise error
+        return list(results.values())
 
     @_api_errors
     async def get_stocks(self, symbols: list[str]) -> list[StockInfo]:
@@ -304,20 +353,7 @@ class TossInvestClient:
 
     @_api_errors
     async def get_market_indicator_prices(self, symbols: list[str]) -> list[Price]:
-        if not symbols:
-            return []
-        results: list[Price] = []
-        for batch in _chunk(symbols, MAX_SYMBOLS_PER_CALL):
-            response = await self._request(
-                "GET",
-                "/api/v1/market-indicators/prices",
-                params={"symbols": ",".join(batch)},
-            )
-            data = response.json()
-            results.extend(
-                Price.from_market_indicator_json(item) for item in data["result"]
-            )
-        return results
+        return await self._get_price_batches(symbols, is_index=True)
 
     @_api_errors
     async def get_market_indicator_candles(

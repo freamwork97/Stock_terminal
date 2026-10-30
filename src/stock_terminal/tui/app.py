@@ -11,7 +11,7 @@ from textual.containers import Horizontal
 from textual.widgets import DataTable, Header, Input, Static, Button
 
 from stock_terminal.api.client import INDEX_CATALOG, TossInvestClient, trading_day_key as _trading_day_key
-from stock_terminal.api.exceptions import TossAPIError
+from stock_terminal.api.exceptions import TossAPIError, TossPartialPricesError
 from stock_terminal.quote_order import QuoteOrder
 from stock_terminal.polling import PollingHealth
 from stock_terminal.diagnostics import HealthReporter, record
@@ -178,18 +178,28 @@ class StockTerminalApp(App):
                 return
             request_id = self._quote_order.begin(self.watchlist.items)
             try:
-                prices = await fetch(requested)
+                partial = None
+                try:
+                    prices = await fetch(requested)
+                except TossPartialPricesError as exc:
+                    partial = exc
+                    prices = exc.prices
                 current = {s for s in requested if self.watchlist.items.get(s) is items[s]}
                 price_map = {p.symbol: p for p in prices if p.symbol in current}
                 eligible = {s for s in current if self._quote_order.is_current(s, items[s], request_id)}
-                missing = eligible - price_map.keys()
+                invalid = eligible & partial.failed_symbols if partial else set()
+                missing = eligible - price_map.keys() - invalid
                 accepted = {s: p for s, p in price_map.items()
                             if self._quote_order.accept(p, items[s], request_id)}
-                if accepted or missing:
-                    self._poll_health.receive(len(accepted), missing=len(missing))
+                if accepted or missing or invalid:
+                    self._poll_health.receive(len(accepted), failure=len(invalid), missing=len(missing))
                     table.apply_prices(accepted, self.watchlist)
                     table.mark_missing(list(missing), set())
-                    self._health.report(operation, missing=len(missing))
+                    table.mark_failed(list(invalid))
+                    self._health.report(operation, error=partial if invalid else None,
+                                        missing=len(missing), invalid=len(invalid))
+                    if invalid:
+                        errors.append(f"{len(invalid)}개 종목의 응답 오류")
             except TossAPIError as exc:
                 failed = [s for s in requested if self.watchlist.items.get(s) is items[s]
                           and self._quote_order.is_current(s, items[s], request_id)]

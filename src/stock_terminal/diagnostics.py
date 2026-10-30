@@ -84,7 +84,8 @@ def error_details(error: BaseException) -> tuple[str, int | None]:
 
 
 def record(event: str, operation: str, *, error: BaseException | None = None,
-           count: int | None = None, delay: float | None = None, metrics: dict | None = None) -> None:
+           count: int | None = None, delay: float | None = None, metrics: dict | None = None,
+           failure_count: int | None = None, missing_count: int | None = None) -> None:
     if event not in EVENTS or operation not in OPERATIONS:
         return
     payload = {"time_utc": datetime.now(timezone.utc).isoformat(), "event": event, "operation": operation}
@@ -95,6 +96,9 @@ def record(event: str, operation: str, *, error: BaseException | None = None,
             payload["http_status"] = status
     if type(count) is int and count >= 0:
         payload["count"] = count
+    for key, value in (("failure_count", failure_count), ("missing_count", missing_count)):
+        if type(value) is int and value >= 0:
+            payload[key] = value
     if type(delay) in (int, float) and math.isfinite(delay) and delay >= 0:
         payload["retry_seconds"] = delay
     if event == "poll_status" and isinstance(metrics, dict):
@@ -123,16 +127,17 @@ class HealthReporter:
     def __init__(self):
         self._failed: dict[str, tuple[str, float]] = {}
 
-    def report(self, operation: str, *, error: BaseException | None = None, missing: int = 0):
+    def report(self, operation: str, *, error: BaseException | None = None, missing: int = 0, invalid: int = 0):
         if operation not in OPERATIONS:
             return
         now = time.monotonic()
-        if error is None and missing == 0:
+        if error is None and missing == 0 and invalid == 0:
             if self._failed.pop(operation, None) is not None:
                 record("operation_recovered", operation)
             return
         kind = repr(error_details(error)) if error else "missing"
         previous = self._failed.get(operation)
         if previous is None or previous[0] != kind or now - previous[1] >= 60:
-            record("operation_failed", operation, error=error, count=missing or None)
+            record("operation_failed", operation, error=error, count=(missing + invalid) or None,
+                   failure_count=invalid or None, missing_count=missing or None)
             self._failed[operation] = (kind, now)

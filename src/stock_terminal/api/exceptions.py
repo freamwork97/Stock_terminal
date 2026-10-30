@@ -31,3 +31,13 @@ class TossRateLimitError(TossAPIError):
     def __init__(self, retry_after: float | None = None) -> None:
         self.retry_after = retry_after
         super().__init__(f"429 Too Many Requests (retry_after={retry_after})")
+
+
+class TossPartialPricesError(TossAPIError):
+    """Some quotes failed validation; valid quotes remain usable."""
+
+    def __init__(self, prices, failed_symbols: set[str], *, unknown_rows: int = 0):
+        super().__init__("일부 종목의 시세 응답이 올바르지 않습니다.")
+        self.prices = prices
+        self.failed_symbols = failed_symbols
+        self.unknown_rows = unknown_rows
