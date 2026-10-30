@@ -10,6 +10,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import math
+
+
+def _number(value: object, *, allow_zero: bool = False) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ValueError("API 숫자 형식 오류")
+    number = Decimal(str(value))
+    if not number.is_finite() or number < 0 or (not allow_zero and number == 0):
+        raise ValueError("API 숫자 범위 오류")
+    # The chart renderer uses float; reject overflow and price underflow here.
+    rendered = float(number)
+    if not math.isfinite(rendered) or (not allow_zero and rendered == 0):
+        raise ValueError("표시할 수 없는 API 숫자 범위")
+    return number
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +40,7 @@ class Price:
         raw_timestamp = data["timestamp"]
         return cls(
             symbol=data["symbol"],
-            last_price=Decimal(str(data["lastPrice"])),
+            last_price=_number(data["lastPrice"]),
             currency=data["currency"],
             timestamp=datetime.fromisoformat(raw_timestamp) if raw_timestamp else None,
         )
@@ -39,7 +53,7 @@ class Price:
         raw_timestamp = data["timestamp"]
         return cls(
             symbol=data["symbol"],
-            last_price=Decimal(str(data["lastPrice"])),
+            last_price=_number(data["lastPrice"]),
             currency="PT",
             timestamp=datetime.fromisoformat(raw_timestamp) if raw_timestamp else None,
         )
@@ -77,13 +91,14 @@ class Candle:
 
     @classmethod
     def from_json(cls, data: dict) -> Candle:
+        opening, high, low, close = (_number(data[key]) for key in
+                                     ("openPrice", "highPrice", "lowPrice", "closePrice"))
+        volume = _number(data.get("volume", "0"), allow_zero=True)
+        if not (low <= opening <= high and low <= close <= high):
+            raise ValueError("API OHLC 범위 오류")
         return cls(
             timestamp=datetime.fromisoformat(data["timestamp"]),
-            open=Decimal(str(data["openPrice"])),
-            high=Decimal(str(data["highPrice"])),
-            low=Decimal(str(data["lowPrice"])),
-            close=Decimal(str(data["closePrice"])),
-            volume=Decimal(str(data.get("volume", "0"))),
+            open=opening, high=high, low=low, close=close, volume=volume,
         )
 
 

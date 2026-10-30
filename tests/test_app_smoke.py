@@ -49,7 +49,7 @@ async def test_app_mounts_and_quits(
         await app.client.aclose()
 
 
-@pytest.mark.parametrize("failure", ["timeout", "connection", "malformed", "server"])
+@pytest.mark.parametrize("failure", ["timeout", "connection", "malformed", "server", "nonfinite"])
 async def test_polling_recovers_after_failure(fake_settings, tmp_path, monkeypatch, failure):
     import asyncio
     from dataclasses import replace
@@ -76,6 +76,9 @@ async def test_polling_recovers_after_failure(fake_settings, tmp_path, monkeypat
                 raise httpx.ConnectError("offline", request=request)
             if failure == "server":
                 return httpx.Response(503)
+            if failure == "nonfinite":
+                return httpx.Response(200, json={"result": [{"symbol": "AAPL",
+                    "lastPrice": "NaN", "currency": "USD", "timestamp": None}]})
             return httpx.Response(200, json={"result": [{}]})
         recovered.set()
         return httpx.Response(200, json={"result": [{"symbol": "AAPL",
